@@ -1,10 +1,13 @@
 appname=icloud-photos
 version=0.3.0
 display_name=iCloud 照片归档
-desc=将 iCloud 照片和视频按原始格式下载到选定的 NAS 文件夹，保留实况照片的静态图与配套视频。支持多个 Apple 账户、定时下载和失败提醒。
+desc=将 iCloud 照片和视频按原始格式下载到选定的 NAS 文件夹，保留实况照片的静态图与配套视频。支持多个 Apple 账户、定时下载和失败提醒。<br><br>使用方法：<br>1. 打开应用，点击「添加账户」，填写 Apple 账户、服务地区和 NAS 保存目录。<br>2. 点击「保存并开始下载」，按页面提示输入 Apple 账户密码和受信任设备上的验证码。<br>3. 选择自动下载频率，之后会按计划下载新增的照片和视频。<br>4. 要保存到其他文件夹，请先在「应用设置」中为本应用授权该文件夹的读写权限。<br>5. 可在「通知设置」中配置 Bark、ntfy、Telegram 或邮件，在需要验证或下载失败时收到提醒。
 platform=x86
 source=thirdparty
-maintainer=iCloud 照片归档项目
+maintainer=Ramos
+maintainer_url=https://blog.dtft.net/about
+distributor=Ramos
+distributor_url=https://blog.dtft.net/about
 desktop_uidir=ui
 desktop_applaunchname=icloud-photos.main
 install_dep_apps=python312

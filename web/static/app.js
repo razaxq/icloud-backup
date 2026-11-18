@@ -61,7 +61,7 @@ let suggestDestination = false;
 let notifyDirty = false;
 let renderedAccounts = "";
 let renderedHistory = "";
-let renderedLog = "";
+let renderedLog = [];
 let browseState = { path: "", parent: "" };
 let pendingDelete = null;
 
@@ -110,7 +110,8 @@ function showNotice(message, kind = "error") {
 function hidePrivateState() {
   state = null;
   suggestDestination = notifyDirty = false;
-  renderedAccounts = renderedHistory = renderedLog = "";
+  renderedAccounts = renderedHistory = "";
+  renderedLog = [];
   $("dashboard").hidden = true;
   $("notify-shortcut").hidden = true;
   $("add-account").hidden = true;
@@ -241,10 +242,17 @@ function renderSummary() {
   $("next-run").textContent = next ? formatTime(next) : "尚未安排";
   $("last-success").textContent = last ? formatTime(last) : "暂无记录";
   $("version").textContent = state.version ? "v" + state.version : "";
+  $("hero-actions").hidden = !active;
   $("cancel").hidden = !active;
   $("cancel").disabled = busy || status === "cancelling";
   $("cancel").textContent = status === "cancelling" ? "正在取消…" : "取消任务";
-  $("add-account").disabled = busy || accounts.length >= MAX_ACCOUNTS;
+  updateAddButton();
+}
+
+function updateAddButton() {
+  // Unavailable while the editor is open: it would replace the account being edited.
+  const count = state ? (state.accounts || []).length : 0;
+  $("add-account").disabled = busy || !state || count >= MAX_ACCOUNTS || !$("editor").hidden;
 }
 
 function renderChallenge(job) {
@@ -284,14 +292,37 @@ function logLine(text) {
     el("span", {}, match ? match[2] : text));
 }
 
+function patchLog(log, previous, lines) {
+  // The server keeps a bounded buffer: lines drop off the front, new ones are
+  // appended, and download progress rewrites the last line. Find how many old
+  // lines dropped off so that everything but the old last line still lines up.
+  const aligned = (drop) => {
+    const keep = previous.length - drop - 1;
+    if (keep > lines.length) return false;
+    for (let i = 0; i < keep; i++) if (previous[drop + i] !== lines[i]) return false;
+    return true;
+  };
+  if (!previous.length || log.children.length !== previous.length) {
+    log.replaceChildren(...lines.map(logLine));
+    return;
+  }
+  let drop = 0;
+  while (!aligned(drop)) drop++;  // terminates: drop = length - 1 always aligns
+  for (let i = 0; i < drop; i++) log.firstElementChild.remove();
+  const keep = previous.length - drop - 1;
+  const oldLast = log.children[keep];
+  if (keep >= lines.length) oldLast.remove();
+  else if (previous[previous.length - 1] !== lines[keep]) oldLast.replaceWith(logLine(lines[keep]));
+  log.append(...lines.slice(keep + 1).map(logLine));
+}
+
 function renderLog(job, logs) {
   const log = $("log");
   const lines = Array.isArray(logs) ? logs.map(String) : [];
-  const text = lines.join("\n");
-  if (text !== renderedLog) {
+  if (lines.length !== renderedLog.length || lines.some((line, i) => line !== renderedLog[i])) {
     const nearBottom = log.hidden || log.scrollHeight - log.scrollTop - log.clientHeight < 24;
-    renderedLog = text;
-    log.replaceChildren(...lines.map(logLine));
+    patchLog(log, renderedLog, lines);
+    renderedLog = lines;
     log.hidden = !lines.length;
     if (nearBottom) log.scrollTop = log.scrollHeight;
   }
@@ -389,6 +420,7 @@ function openEditor(account) {
   $("editor").hidden = false;
   $("accounts-card").hidden = true;
   $("no-accounts").hidden = true;
+  updateAddButton();
   $("editor-title").scrollIntoView({ block: "nearest" });
   $("account").focus({ preventScroll: true });
 }
@@ -401,6 +433,7 @@ function closeEditor() {
   $("editor").hidden = true;
   $("accounts-card").hidden = false;
   $("no-accounts").hidden = Boolean(state && (state.accounts || []).length);
+  updateAddButton();
 }
 
 function updatePathHelp() {

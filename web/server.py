@@ -13,12 +13,13 @@ from pathlib import Path
 import signal
 import socketserver
 import stat
+import sys
 import threading
 from urllib.parse import parse_qs, urlsplit
 
-from archive import Archive, RequestError
-
 BASE = Path(__file__).resolve().parent
+sys.path.insert(0, str(BASE.parent))  # the worker package, imported by archive
+from archive import Archive, RequestError  # noqa: E402
 
 
 class Gateway(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):

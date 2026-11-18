@@ -1,7 +1,11 @@
 """Account, schedule, download and notification state behind the gateway.
 
-Everything here is independent of HTTP: the gateway in server.py turns requests
-into calls on Archive and RequestError back into responses.
+The gateway in server.py turns requests into calls on Archive. Validation and
+permission failures raise RequestError, which carries the user-facing message
+and the status code the gateway answers with.
+
+Expects the project root and this directory on sys.path (server.py sets both
+up), so that `worker` and `notifier` import.
 """
 import collections
 import datetime as dt
@@ -10,16 +14,13 @@ import os
 from pathlib import Path
 import secrets
 import shutil
-import sys
 import tempfile
 import threading
 import time
 import traceback
 
-BASE = Path(__file__).resolve().parent
-sys.path.insert(0, str(BASE.parent))
-from worker.engine import run_sync, session_path, SyncError, SyncCancelled  # noqa: E402
-import notifier  # noqa: E402
+from worker.engine import run_sync, session_path, SyncError, SyncCancelled
+import notifier
 
 
 class RequestError(Exception):
