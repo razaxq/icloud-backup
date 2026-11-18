@@ -1,0 +1,5 @@
+{
+  "defaults": { "run-as": "package" },
+  "username": "icloud-photos",
+  "groupname": "icloud-photos"
+}

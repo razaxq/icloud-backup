@@ -1,0 +1,15 @@
+appname=icloud-photos
+version=0.3.0
+display_name=iCloud 照片归档
+desc=将 iCloud 照片和视频按原始格式下载到选定的 NAS 文件夹，保留实况照片的静态图与配套视频。支持多个 Apple 账户、定时下载和失败提醒。
+platform=x86
+source=thirdparty
+maintainer=iCloud 照片归档项目
+desktop_uidir=ui
+desktop_applaunchname=icloud-photos.main
+install_dep_apps=python312
+os_min_version=1.1.3100
+ctl_stop=true
+checkport=false
+disable_authorization_path=false
+changelog=加入原件与实况视频完整性检查，缺原件或缺配套视频的任务记为失败并等待补扫。修复多账户目录、异常中断恢复、通知凭据及安装包校验问题。

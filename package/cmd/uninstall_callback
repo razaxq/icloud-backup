@@ -1,0 +1,12 @@
+#!/bin/bash
+# Downloaded photos live in the shared folders and are never removed here.
+set -u
+if [[ "${wizard_data_action:-keep}" == "delete" && -n "${TRIM_PKGVAR:-}" && -d "${TRIM_PKGVAR}" ]]; then
+    # Saved Apple sessions are credentials; remove them with the settings.
+    rm -rf -- "${TRIM_PKGVAR}/state" "${TRIM_PKGVAR}/roots" "${TRIM_PKGVAR}/server.log" \
+        "${TRIM_PKGVAR}/server.pid" "${TRIM_PKGVAR}/lifecycle.lock" || {
+        [[ -n "${TRIM_TEMP_LOGFILE:-}" ]] && echo '部分应用数据未能删除，请在应用数据目录中手动清理。' > "$TRIM_TEMP_LOGFILE"
+        exit 1
+    }
+fi
+exit 0

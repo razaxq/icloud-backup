@@ -1,0 +1,7 @@
+# Shell scripts and Python run on the NAS: always check out with LF.
+* text=auto eol=lf
+
+*.png binary
+*.PNG binary
+*.woff2 binary
+*.fpk binary

@@ -1,0 +1,22 @@
+[
+  {
+    "stepTitle": "卸载 iCloud 照片归档",
+    "items": [
+      {
+        "type": "tips",
+        "helpText": "已下载的照片和视频保存在 NAS 文件夹中，卸载不会删除它们。"
+      },
+      {
+        "type": "radio",
+        "field": "wizard_data_action",
+        "label": "应用数据",
+        "initValue": "keep",
+        "options": [
+          { "label": "保留 Apple 登录会话和设置（重新安装后可直接继续）", "value": "keep" },
+          { "label": "删除 Apple 登录会话、设置和运行记录", "value": "delete" }
+        ],
+        "rules": [{ "required": true, "message": "请选择如何处理应用数据" }]
+      }
+    ]
+  }
+]
