@@ -1,5 +1,8 @@
 """Per-asset archiving for the bundled icloudpd 1.33.0 CLI."""
 
+from . import catalog
+
+from contextlib import ExitStack
 import base64
 import binascii
 import hashlib
@@ -31,7 +34,7 @@ def signature(version):
     return value
 
 
-def matches(path, size, expected):
+def matches(path, size, expected, *, durable=False, content_hash=None):
     try:
         mode = path.lstat().st_mode
     except FileNotFoundError:
@@ -45,6 +48,10 @@ def matches(path, size, expected):
         digest = hashlib.sha1(SALT, usedforsecurity=False)
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
+            if content_hash is not None:
+                content_hash.update(chunk)
+        if durable:
+            os.fsync(stream.fileno())
         after = os.fstat(stream.fileno())
         same_file = os.path.samestat(after, path.lstat())
     return (same_file and before.st_ctime_ns == after.st_ctime_ns and before.st_mtime_ns == after.st_mtime_ns
@@ -104,6 +111,34 @@ def publish_verified(path, version, fetch):
     return True
 
 
+def described_resource(fields, prefix):
+    from pyicloud_ipd.asset_version import AssetVersion
+    data = fields.get(prefix + "Res", {}).get("value")
+    uti = fields.get(prefix + "FileType", {}).get("value")
+    if not (isinstance(data, dict) and isinstance(uti, str) and uti and data.get("downloadURL")
+            and data.get("fileChecksum") and type(data.get("size")) is int and data["size"] > 0):
+        return None
+    return AssetVersion(data["size"], data["downloadURL"], uti, data["fileChecksum"])
+
+
+def available_versions(photo):
+    from pyicloud_ipd.item_type import AssetItemType
+    try:
+        return photo.versions, []
+    except (KeyError, TypeError, ValueError):
+        # A malformed companion makes the pinned parser discard all versions.
+        # Recover each independently described file and retain a failure for this item.
+        lookup = photo.VIDEO_VERSION_LOOKUP if photo.item_type == AssetItemType.MOVIE else photo.PHOTO_VERSION_LOOKUP
+        found = {}
+        for size, prefix in lookup.items():
+            for record in (photo._asset_record, photo._master_record):
+                version = described_resource(record["fields"], prefix)
+                if version is not None:
+                    found[size] = version
+                    break
+        return found, ["record"]
+
+
 def renditions(photo, name, primary_sizes, lp_filename_generator):
     """Choose originals, additional advertised resources and labelled fallback copies."""
     from pyicloud_ipd.asset_version import add_suffix_to_filename, calculate_version_filename
@@ -111,7 +146,7 @@ def renditions(photo, name, primary_sizes, lp_filename_generator):
     from pyicloud_ipd.utils import disambiguate_filenames
     from pyicloud_ipd.version_size import AssetVersionSize as Asset, LivePhotoVersionSize as Live
 
-    versions = photo.versions
+    versions, missing = available_versions(photo)
     selected = [size for size in primary_sizes if size in versions]
     _, overrides = disambiguate_filenames(versions, selected, photo, lp_filename_generator, name)
     fields = photo._asset_record["fields"]
@@ -122,7 +157,6 @@ def renditions(photo, name, primary_sizes, lp_filename_generator):
             or any(key.startswith("resOriginalVidCompl") for record in records for key in record)
             or (photo.item_type == AssetItemType.IMAGE and
                 any(record.get("hasVidCompl", {}).get("value") in (True, 1, "1") for record in records)))
-    missing = []
     previews = set()
     required = [(Asset.ORIGINAL, (Asset.MEDIUM, Asset.THUMB), "original")]
     if live:
@@ -151,14 +185,119 @@ def renditions(photo, name, primary_sizes, lp_filename_generator):
         if not filename or Path(filename).name != filename or filename in (".", ".."):
             raise IntegrityError("local-path")
         files.append((size, version, filename, isinstance(size, Asset) and size not in previews))
-    return files, missing
+    # The upstream versions map omits auxiliary resources and type-only records.
+    from pyicloud_ipd.asset_version import ITEM_TYPE_EXTENSIONS
+    known = {"resOriginal", "resOriginalAlt", "resOriginalVidCompl", "resJPEGFull",
+             "resJPEGMed", "resJPEGThumb", "resVidMed", "resVidSmall", "resJPEGLarge"}
+    for prefix, size, reason in (("resOriginalAlt", Asset.ALTERNATIVE, "raw"),
+                                 ("resJPEGFull", Asset.ADJUSTED, "adjusted")):
+        if size not in versions and any(k.startswith(prefix) and v.get("value")
+                                        for rec in records for k, v in rec.items()):
+            missing.append(reason)
+    suffixes = ("Res", "FileType", "Fingerprint", "Width", "Height")
+    def add_extra(rec, prefix, source):
+        version = described_resource(rec, prefix)
+        if version is None:
+            missing.append("auxiliary")
+            return
+        role = source + "-" + prefix
+        ext = ITEM_TYPE_EXTENSIONS.get(version.type, "bin")
+        files.append((role, version, f"{role}.{ext}", False))
+
+    for source, rec in zip(("asset", "master"), records):
+        prefixes = {key[:-len(suffix)] for key, field in rec.items() if key.startswith("res") and field.get("value")
+                    for suffix in suffixes if key.endswith(suffix)}
+        for prefix in sorted(prefixes - known):
+            if prefix in ("resSidecar", "resVidFull"):
+                add_extra(rec, prefix, source)
+            else:
+                missing.append("auxiliary")
+    for prefix in ("resOriginal", "resOriginalAlt", "resOriginalVidCompl", "resJPEGFull"):
+        values = [rec.get(prefix + "Res", {}).get("value") for rec in records]
+        if all(isinstance(value, dict) for value in values) and values[0].get("fileChecksum") != values[1].get("fileChecksum"):
+            # The pinned downloader prefers the asset field. Preserve the other resource independently.
+            add_extra(records[1], prefix, "master")
+            missing.append("conflicting-resource")
+    edited = any(fields.get(key, {}).get("value") not in (None, "", 0, "0")
+                 for key in ("adjustmentType", "adjustmentRenderType", "adjustmentSimpleDataEnc"))
+    if edited and (not fields.get("adjustmentSimpleDataEnc", {}).get("value")
+                   or not (Asset.ADJUSTED in versions or any("resVidFullRes" in rec for rec in records))):
+        missing.append("edit")
+    names = [filename.casefold() for _, _, filename, _ in files]
+    if len(names) != len(set(names)) or any(n in (".identity.json", "manifest.json", ".icloud-work", ".icloud-previous")
+                                            or n + ".xmp" in names for n in names):
+        raise IntegrityError("local-path")
+    return files, list(dict.fromkeys(missing))
+
+
+def check_options(folder_structure, primary_sizes, force_size, set_exif_datetime, skip_live_photos,
+                  live_photo_size, dry_run, file_match_policy, raw_policy):
+    from pyicloud_ipd.version_size import AssetVersionSize as Asset, LivePhotoVersionSize as Live
+    if (dry_run or skip_live_photos or set_exif_datetime or force_size
+            or live_photo_size != Live.ORIGINAL or set(primary_sizes) != {Asset.ORIGINAL, Asset.ALTERNATIVE, Asset.ADJUSTED}
+            or folder_structure != "{:%Y/%m}" or file_match_policy.value != "name-id7"
+            or raw_policy.value != "as-is"):
+        raise RuntimeError("Unexpected archive options")
+
+
+def present(path, size=None):
+    """Check regular-file metadata only. Generated sidecars have no remote size."""
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return False
+    return stat.S_ISREG(info.st_mode) and info.st_size > 0 and (size is None or info.st_size == size)
+
+
+class ProbeArchive:
+    """--only-print-filenames: report newest assets whose files are not on disk yet.
+
+    Nothing is downloaded or written. The worker starts a strict quick check
+    when anything is reported, and that run verifies every byte as usual.
+    """
+
+    def __init__(self, zone="PrimarySync"):
+        self.failed = False
+        self.zone = zone
+
+    def __call__(self, logger, folder_structure, directory, primary_sizes, force_size,
+                 only_print_filenames, set_exif_datetime, skip_live_photos, live_photo_size,
+                 dry_run, file_match_policy, xmp_sidecar, lp_filename_generator,
+                 filename_builder, raw_policy, icloud, counter, photo):
+        from icloudpd import base
+        from tzlocal import get_localzone
+
+        check_options(folder_structure, primary_sizes, force_size, set_exif_datetime, skip_live_photos,
+                      live_photo_size, dry_run, file_match_policy, raw_policy)
+        if not only_print_filenames:
+            raise RuntimeError("Unexpected probe options")
+        try:
+            name = filename_builder(photo)
+            created = photo.created.astimezone(get_localzone())
+            folder = Path(directory).joinpath(*Path(folder_structure.format(created)).parts)
+            files, missing = renditions(photo, name, primary_sizes, lp_filename_generator)
+            folder = catalog.layout(folder, catalog.identity(icloud, self.zone, photo), catalog.revision(photo))
+            complete = not missing and present(folder / "manifest.json") and present(folder / ".identity.json")
+            for _, version, filename, needs_sidecar in files:
+                signature(version)
+                if (not present(folder / filename, version.size)
+                        or (xmp_sidecar and needs_sidecar and not present(folder / (filename + ".xmp")))):
+                    complete = False
+                    break
+        except (IntegrityError, KeyError, IndexError, OSError, TypeError, ValueError, OverflowError):
+            complete = False  # let the strict run inspect and report it
+        if not complete:
+            print(PROTOCOL + "pending", flush=True)
+        return base.DownloadResult(downloaded=False, present=complete)
 
 
 class StrictArchive:
     """The pinned CLI supplies its resolved naming policy, session, counter and asset."""
 
-    def __init__(self):
+    def __init__(self, inventory=None, zone="PrimarySync"):
         self.failed = False
+        self.inventory = inventory
+        self.zone = zone
 
     def issue(self, reason, name):
         self.failed = True
@@ -171,16 +310,16 @@ class StrictArchive:
                  only_print_filenames, set_exif_datetime, skip_live_photos, live_photo_size,
                  dry_run, file_match_policy, xmp_sidecar, lp_filename_generator,
                  filename_builder, raw_policy, icloud, counter, photo):
+        from . import retention
         from icloudpd import base, download
-        from pyicloud_ipd.version_size import AssetVersionSize as Asset, LivePhotoVersionSize as Live
         from tzlocal import get_localzone
 
-        if (dry_run or skip_live_photos or set_exif_datetime or only_print_filenames or force_size
-                or live_photo_size != Live.ORIGINAL or set(primary_sizes) != {Asset.ORIGINAL, Asset.ALTERNATIVE, Asset.ADJUSTED}
-                or folder_structure != "{:%Y/%m}" or file_match_policy.value != "name-id7"
-                or raw_policy.value != "as-is"):
+        check_options(folder_structure, primary_sizes, force_size, set_exif_datetime, skip_live_photos,
+                      live_photo_size, dry_run, file_match_policy, raw_policy)
+        if only_print_filenames:
             raise RuntimeError("Unexpected archive options")
         name = ""
+        locks = ExitStack()
         try:
             name = filename_builder(photo)
             folder = Path(directory)
@@ -194,6 +333,14 @@ class StrictArchive:
                 folder = folder / component
                 make_directory(folder)
             files, missing = renditions(photo, name, primary_sizes, lp_filename_generator)
+            item = catalog.identity(icloud, self.zone, photo)
+            rev = catalog.revision(photo)
+            month, root = folder, Path(directory)
+            folder = catalog.layout(month, item, rev)
+            make_directory(folder.parent)
+            make_directory(folder)
+            locks.enter_context(catalog.claim(folder, item, rev))
+            resources = []
             for reason in missing:
                 self.issue(reason, name)
             complete = not missing
@@ -201,23 +348,46 @@ class StrictArchive:
             for size, version, filename, needs_sidecar in files:
                 path = folder / filename
                 try:
+                    # Read old archives without modifying them. A matching hash proves the bytes
+                    # can be copied. The authenticated cloud record supplies ownership and metadata.
+                    expected = signature(version)
+                    legacy = retention.match_legacy(self.inventory, month, filename, version.size, expected)
                     def fetch(stage):
+                        if legacy is not None:
+                            shutil.copyfile(legacy, stage)
+                            return True
+                        transfer_size = size
+                        if isinstance(size, str):
+                            from pyicloud_ipd.version_size import AssetVersionSize
+                            transfer_size = AssetVersionSize.ORIGINAL
                         return download.download_media(logger, False, icloud, photo, stage,
-                                                       version, size, filename_builder)
+                                                       version, transfer_size, filename_builder)
                     if publish_verified(path, version, fetch):
                         written.append(str(path))
                         download.update_mtime(photo.created, str(path))
                         logger.info("Downloaded verified media")
+                    content_hash = hashlib.sha256()
+                    if not matches(path, version.size, expected, durable=True, content_hash=content_hash):
+                        raise IntegrityError("mismatch")
+                    role = size if type(size) is str else type(size).__name__ + "." + size.name
+                    entry = dict(role=role, name=filename, bytes=version.size, appleChecksum=expected.hex(),
+                                 type=version.type, sha256=content_hash.hexdigest())
                     if xmp_sidecar and needs_sidecar:
                         sidecar = Path(str(path) + ".xmp")
-                        if sidecar.is_symlink():
-                            raise IntegrityError("local-path")
-                        base.generate_xmp_file(logger, str(path), photo._asset_record, False)
-                        if not sidecar.is_file() or not sidecar.stat().st_size:
-                            raise IntegrityError("metadata")
+                        data = catalog.xmp_bytes(photo._asset_record)
+                        catalog.write_atomic(sidecar, data)
+                        retention.match_legacy_xmp(self.inventory, month, filename + ".xmp", data)
+                        entry["xmpSHA256"] = hashlib.sha256(data).hexdigest()
+                    resources.append(entry)
                 except (IntegrityError, OSError) as exc:
-                    self.issue(str(exc) if isinstance(exc, IntegrityError) else "io", filename)
+                    reason = str(exc) if isinstance(exc, IntegrityError) else "io"
+                    self.issue(reason, filename)
+                    missing.append(reason)
                     complete = False
+            original_name = photo.calculate_filename() or name
+            manifest = catalog.save_manifest(folder, root, photo, item, rev, original_name, resources, missing)
+            if self.inventory is not None:
+                retention.record_asset(self.inventory, folder, manifest)
             if complete and not written:
                 counter.increment()
             else:
@@ -227,11 +397,59 @@ class StrictArchive:
             self.issue(str(exc) if isinstance(exc, IntegrityError) else "record", name)
             counter.reset()
             return base.NOT_DOWNLOADED
+        finally:
+            locks.close()
 
 
 def main():
+    import sys
+    from contextlib import closing
+    import sqlite3
+    args = sys.argv[1:]
+    if args[:1] == ["--verify-archive"]:
+        from .retention import verify_report
+        if len(args) != 3:
+            print("用法：icloudpd --verify-archive 还原目录 完整扫描报告.jsonl")
+            return 2
+        try:
+            count = verify_report(Path(args[1]), Path(args[2]))
+        except (OSError, ValueError, KeyError, TypeError, IntegrityError):
+            print("还原核对失败，报告不完整或备份文件的身份、内容、元数据与报告不符。")
+            return 1
+        print(f"还原核对通过，共 {count} 个图库项目。")
+        return 0
+    # This release can preview retention policies. The old mutating entry point is retired.
+    if any(arg.split("=", 1)[0] in ("--fn-cleanup-apply", "--delete-after-download", "--auto-delete",
+                                    "--keep-icloud-recent-days") for arg in args):
+        return 2
+    zone = args[args.index("--library") + 1] if "--library" in args else "PrimarySync"
+    if args[:1] == ["--fn-archive-record"]:
+        path = args[1]
+        del sys.argv[1:3]
+        with closing(sqlite3.connect(path)) as db:
+            status = run_cli(StrictArchive(db, zone))
+            db.commit()  # Incomplete items also belong in migration reports.
+            return status
+    return run_cli(ProbeArchive(zone) if "--only-print-filenames" in args else StrictArchive(zone=zone))
+
+
+def run_cli(archive):
     from icloudpd import base, cli
-    archive = StrictArchive()
+    from pyicloud_ipd.services.photos import PhotosService
+    run = cli.run_with_configs
+    def run_read_only(global_config, users):
+        if len(users) != 1:
+            return 2
+        user = users[0]
+        if (user.delete_after_download or user.auto_delete or user.prune_orphans
+                or user.keep_icloud_recent_days is not None):
+            return 2
+        archive.zone = user.library or "PrimarySync"
+        return run(global_config, users)
+
+    cli.run_with_configs = run_read_only
+    discover = PhotosService._fetch_libraries
+    PhotosService._fetch_libraries = catalog.discover_libraries
     upstream = base.download_builder
     base.download_builder = archive
     try:
@@ -240,3 +458,5 @@ def main():
         return status or int(archive.failed)
     finally:
         base.download_builder = upstream
+        PhotosService._fetch_libraries = discover
+        cli.run_with_configs = run

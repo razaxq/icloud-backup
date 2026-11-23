@@ -2,7 +2,9 @@
 
 const $ = (id) => document.getElementById(id);
 
-const ACTIVE = new Set(["running", "waiting_password", "waiting_code", "cancelling"]);
+const ACTIVE = new Set(["running", "waiting_password", "waiting_code", "cancelling", "pausing"]);
+const PAUSABLE = new Set(["running", "waiting_password", "waiting_code"]);
+const SETTINGS_SECTIONS = ["notify", "watch", "about"];
 const MAX_ACCOUNTS = 10;
 const statusLabels = {
   idle: "就绪",
@@ -10,6 +12,8 @@ const statusLabels = {
   waiting_password: "等待账户密码",
   waiting_code: "等待验证码",
   cancelling: "正在取消",
+  pausing: "正在暂停",
+  paused: "已暂停",
   success: "下载完成",
   partial: "完成（有提醒）",
   error: "未能完成",
@@ -17,10 +21,10 @@ const statusLabels = {
   interrupted: "已中断",
   unverified: "旧版未校验"
 };
-const triggerLabels = { manual: "手动", schedule: "定时", resume: "自动继续" };
-const triggerContext = { manual: "手动开始", schedule: "定时运行", resume: "自动继续" };
+const triggerLabels = { manual: "手动", schedule: "定时", resume: "自动继续", watch: "实时" };
+const triggerContext = { manual: "手动开始", schedule: "定时运行", resume: "自动继续", watch: "实时检测" };
 const statusTones = {
-  running: "tone-live", cancelling: "tone-live", success: "tone-ok",
+  running: "tone-live", cancelling: "tone-live", pausing: "tone-live", paused: "tone-warn", success: "tone-ok",
   waiting_password: "tone-warn", waiting_code: "tone-warn", partial: "tone-warn",
   interrupted: "tone-warn", unverified: "tone-warn", error: "tone-err"
 };
@@ -59,10 +63,12 @@ let challengeId = null;
 let editing = null;
 let suggestDestination = false;
 let notifyDirty = false;
+let watchDirty = false;
 let renderedAccounts = "";
 let renderedHistory = "";
 let renderedLog = [];
 let browseState = { path: "", parent: "" };
+let browseRequest = 0;
 let pendingDelete = null;
 
 function el(tag, props = {}, ...children) {
@@ -109,12 +115,15 @@ function showNotice(message, kind = "error") {
 
 function hidePrivateState() {
   state = null;
+  closeBrowser();
   suggestDestination = notifyDirty = false;
   renderedAccounts = renderedHistory = "";
   renderedLog = [];
   $("dashboard").hidden = true;
-  $("notify-shortcut").hidden = true;
+  $("settings-view").hidden = true;
+  $("open-settings").hidden = true;
   $("add-account").hidden = true;
+  setPauseMenu(false);
   $("challenge-value").value = "";
   $("account-form").reset();
   $("notify-form").reset();
@@ -132,10 +141,11 @@ async function api(name, payload) {
   if (post) headers["Content-Type"] = "application/json";
   const response = await fetch("./api/" + name, {
     method: post ? "POST" : "GET",
+    mode: "same-origin",
     headers,
     credentials: "same-origin",
     cache: "no-store",
-    body: post ? JSON.stringify(payload) : undefined
+    body: post ? JSON.stringify({ ...payload, _csrf: state?.csrf_token }) : undefined
   });
   let result = {};
   try {
@@ -174,7 +184,8 @@ function intervalLabel(hours) {
 
 function scheduleLabel(account) {
   if (!account.interval_hours) return "仅手动";
-  return intervalLabel(account.interval_hours) + (account.scan === "full" ? " · 完整扫描" : " · 快速检查");
+  const full = account.scan === "full" || (account.cleanup && account.cleanup.mode !== "off");
+  return intervalLabel(account.interval_hours) + (full ? " · 完整扫描" : " · 快速检查");
 }
 
 function statusChip(status, text) {
@@ -204,15 +215,18 @@ function renderSummary() {
   const label = statusLabels[status] || "正在处理";
   const accounts = state.accounts || [];
   const active = ACTIVE.has(status);
-  $("job-status").textContent = label;
+  const paused = status === "paused";
+  const probing = active && job.watch;
+  $("job-status").textContent = probing && status === "running" ? "检查新照片" : label;
   $("status-dot").dataset.status = status;
   $("job-chip").className = "chip " + (statusTones[status] || "");
 
   const context = [];
   if (status !== "idle" && job.trigger) {
-    context.push(triggerContext[job.trigger] || job.trigger, job.full_scan ? "完整扫描" : "快速检查");
+    context.push(triggerContext[job.trigger] || job.trigger);
+    if (!probing) context.push(job.full_scan ? "完整扫描" : "快速检查");
   }
-  if (active && job.started_at) context.push(elapsedLabel(job.started_at));
+  if (active && !probing && job.started_at) context.push(elapsedLabel(job.started_at));
   $("job-context").textContent = context.filter(Boolean).join(" · ");
 
   let title;
@@ -223,17 +237,24 @@ function renderSummary() {
   } else if (verification[status]) {
     title = "等待验证 · " + (job.account || "Apple 账户");
     sub = "Apple 要求验证此账户，完成验证后继续下载。";
-  } else if (status === "running" || status === "cancelling") {
-    title = (status === "running" ? "正在归档 " : "正在取消 · ") + (job.account || "");
+  } else if (probing && status === "running") {
+    title = "正在检查新照片 · " + (job.account || "");
+    sub = "实时检测：查看 iCloud 中最新的项目。";
+  } else if (status === "running" || status === "cancelling" || status === "pausing") {
+    title = { running: "正在归档 ", cancelling: "正在取消 · ", pausing: "正在暂停 · " }[status] + (job.account || "");
+  } else if (paused) {
+    title = "已暂停 · " + (job.account || "");
+    sub = (job.pause_until ? "将于 " + formatTime(job.pause_until) + " 自动继续。" : "点击「继续」后接着下载。")
+      + "已下载的文件和未完成的传输都会保留，其他账户的计划任务也会等到继续或取消后再运行。";
   } else {
     title = label + (job.account ? " · " + job.account : "");
   }
   $("hero-title").textContent = title;
   $("hero-sub").textContent = sub;
-  $("job-bar").hidden = !(status === "running" || status === "cancelling");
+  $("job-bar").hidden = !(status === "running" || status === "cancelling" || status === "pausing");
 
-  const counting = active || (status !== "idle" && Number.isInteger(job.downloaded));
-  $("stat-first-label").textContent = counting ? (active ? "本次新增" : "上次任务新增") : "账户";
+  const counting = (active && !probing) || paused || (status !== "idle" && !probing && Number.isInteger(job.downloaded));
+  $("stat-first-label").textContent = counting ? (active || paused ? "本次新增" : "上次任务新增") : "账户";
   $("stat-first-icon").setAttribute("href", counting ? "#i-download" : "#i-users");
   $("stat-first").textContent = counting ? String(job.downloaded || 0) : accounts.length + " / " + MAX_ACCOUNTS;
 
@@ -242,8 +263,15 @@ function renderSummary() {
   $("next-run").textContent = next ? formatTime(next) : "尚未安排";
   $("last-success").textContent = last ? formatTime(last) : "暂无记录";
   $("version").textContent = state.version ? "v" + state.version : "";
-  $("hero-actions").hidden = !active;
-  $("cancel").hidden = !active;
+  const pausable = PAUSABLE.has(status);
+  $("hero-actions").hidden = !(active || paused);
+  $("resume").hidden = !paused;
+  $("resume").disabled = busy;
+  $("pause-wrap").hidden = !(pausable || status === "pausing");
+  $("pause").disabled = busy || !pausable;
+  $("pause-label").textContent = status === "pausing" ? "正在暂停…" : "暂停";
+  if (!pausable || busy) setPauseMenu(false);
+  $("cancel").hidden = !(active || paused) || status === "pausing";
   $("cancel").disabled = busy || status === "cancelling";
   $("cancel").textContent = status === "cancelling" ? "正在取消…" : "取消任务";
   updateAddButton();
@@ -336,11 +364,24 @@ function renderLog(job, logs) {
 
 /* ---------- accounts ---------- */
 
+function watchMeta(account) {
+  if (!account.watch) return null;
+  if (account.watch_state === "suspended") return el("span", { class: "chip tone-warn" }, icon("radar"), "实时检测已暂停");
+  if (account.watch_state === "retry") return el("span", { class: "chip tone-warn" }, icon("radar"), "实时检测稍后重试");
+  return el("span", { class: "chip tone-live", title: account.last_checked ? "最近检查 " + formatTime(account.last_checked) : "" },
+    icon("radar"), "实时检测");
+}
+
 function accountCard(account, job, index) {
-  const active = ACTIVE.has(job.status);
-  const runningHere = active && job.account_id === account.id;
+  const held = ACTIVE.has(job.status) || job.status === "paused";
+  const active = held;
+  const runningHere = held && job.account_id === account.id;
+  const pausedHere = runningHere && job.status === "paused";
   const last = account.last_run;
   const confirming = pendingDelete === account.id;
+  const cleanup = account.cleanup || {};
+  const retentionLabel = { immediate: "预览全部已备份项目", days: "预览保留最近 " + cleanup.value + " 天",
+    latest: "预览保留最新 " + cleanup.value + " 项" }[cleanup.mode];
   const initial = [...String(account.account).trim()][0] || "?";
   return el("article", { class: "account" + (runningHere ? " is-running" : "") },
     el("div", { class: "account-main" },
@@ -351,19 +392,27 @@ function accountCard(account, job, index) {
           el("span", { class: "chip" }, account.domain === "cn" ? "中国大陆" : "全球"),
           runningHere ? statusChip(job.status) : (last ? statusChip(last.status) : null),
           account.resume_pending && !runningHere ? el("span", { class: "chip tone-warn" }, "待继续") : null,
+          watchMeta(account),
           account.needs_full_scan && !runningHere && !account.resume_pending
             ? el("span", { class: "chip tone-warn" }, "待完整检查") : null),
         el("div", { class: "account-path", title: account.destination },
           icon("folder"), el("span", {}, account.destination)),
         el("div", { class: "account-meta" },
+          retentionLabel ? el("span", {}, retentionLabel) : null, retentionLabel ? el("i") : null,
           el("span", {}, scheduleLabel(account)), el("i"),
           el("span", {}, "上次成功 " + (account.last_success ? formatTime(account.last_success) : "暂无")), el("i"),
-          el("span", {}, "下次 " + (account.next_run ? formatTime(account.next_run) : "未安排"))),
-        last && last.message && last.status !== "success" && !runningHere
-          ? el("p", { class: "account-note" }, last.message) : null)),
+          el("span", {}, "下次 " + (account.next_run ? formatTime(account.next_run) : "未安排")),
+          account.watch && account.last_checked ? el("i") : null,
+          account.watch && account.last_checked ? el("span", {}, "最近检查 " + formatTime(account.last_checked)) : null),
+        account.watch_note && !runningHere ? el("p", { class: "account-note" }, account.watch_note)
+          : last && last.message && last.status !== "success" && !runningHere
+            ? el("p", { class: "account-note" }, last.message) : null)),
     el("div", { class: "account-actions" },
-      el("button", { type: "button", class: "btn ghost sm", disabled: busy || active, onclick: () => startAccount(account.id) },
-        icon("play"), runningHere ? "下载中…" : "开始下载"),
+      el("button", {
+        type: "button", class: "btn ghost sm", disabled: busy || active, onclick: () => startAccount(account.id),
+        title: held && !runningHere ? (job.status === "paused" ? "请先继续或取消已暂停的任务" : "其他账户的任务正在运行") : ""
+      }, icon(pausedHere ? "pause" : "play"),
+      runningHere ? (pausedHere ? "已暂停" : job.watch ? "检查中…" : "下载中…") : "开始下载"),
       el("button", {
         type: "button", class: "btn ghost sm icon-only", title: "编辑", "aria-label": "编辑 " + account.account,
         disabled: busy || runningHere, onclick: () => openEditor(account)
@@ -381,7 +430,7 @@ function accountCard(account, job, index) {
 function renderAccounts() {
   const accounts = state.accounts || [];
   const job = state.job || {};
-  const key = JSON.stringify([accounts, job.status, job.account_id, busy, pendingDelete]);
+  const key = JSON.stringify([accounts, job.status, job.account_id, job.watch, busy, pendingDelete]);
   $("account-count").textContent = accounts.length ? accounts.length + " / " + MAX_ACCOUNTS : "";
   $("no-accounts").hidden = accounts.length > 0 || !$("editor").hidden;
   if (key === renderedAccounts) return;
@@ -412,6 +461,12 @@ function openEditor(account) {
   $("interval").value = String(account ? account.interval_hours : 24);
   setRadio("scan", account ? account.scan : "auto");
   $("include-shared").checked = account ? account.include_shared : true;
+  const cleanup = account?.cleanup || { mode: "off", value: 0, shared: false };
+  $("cleanup-mode").value = cleanup.mode;
+  $("cleanup-value").value = cleanup.value || "";
+  $("cleanup-shared").checked = cleanup.shared;
+  updateCleanupFields();
+  $("watch").checked = account ? account.watch : true;
   suggestDestination = !account && state.accounts.length > 0;
   updateSuggestedDestination();
   resetSharedDestination();
@@ -436,10 +491,31 @@ function closeEditor() {
   updateAddButton();
 }
 
+function watchSentence() {
+  const settings = state?.settings || {};
+  return "每 " + (settings.watch_minutes || 10) + " 分钟查看 iCloud 中最新的 " + (settings.watch_recent || 10)
+    + " 个项目，发现新照片时开始下载。";
+}
+
 function updatePathHelp() {
+  $("watch-hint").textContent = watchSentence() + "检测只比对文件是否存在，不读取照片内容。间隔可在「设置 → 实时检测」中调整。";
   const roots = state?.roots || [];
   $("destination").placeholder = state?.default_dir || roots[0] || "输入 NAS 上的完整路径";
   $("account-fields").disabled = busy;
+}
+
+function updateCleanupFields() {
+  const mode = $("cleanup-mode").value;
+  const numeric = mode === "days" || mode === "latest";
+  $("cleanup-amount").hidden = !numeric;
+  $("cleanup-value").disabled = !numeric;
+  $("cleanup-label").textContent = mode === "days" ? "保留最近多少天" : "保留最新多少项";
+  if (numeric && !$("cleanup-value").value) $("cleanup-value").value = mode === "days" ? 30 : 100;
+  $("cleanup-details").hidden = mode === "off";
+  for (const input of document.getElementsByName("scan")) input.disabled = mode !== "off";
+  $("scan-options").hidden = mode !== "off";
+  $("cleanup-shared-label").hidden = !$("include-shared").checked;
+  if (mode === "off" || !$("include-shared").checked) $("cleanup-shared").checked = false;
 }
 
 function editorPayload() {
@@ -450,6 +526,10 @@ function editorPayload() {
     interval_hours: Number($("interval").value),
     scan: radioValue("scan"),
     include_shared: $("include-shared").checked,
+    cleanup: { mode: $("cleanup-mode").value,
+      value: $("cleanup-value").disabled ? 0 : $("cleanup-value").valueAsNumber,
+      shared: $("cleanup-shared").checked },
+    watch: $("watch").checked,
     allow_shared_destination: !$("shared-destination").hidden && $("allow-shared-destination").checked
   };
   if (editing) payload.id = editing;
@@ -457,7 +537,7 @@ function editorPayload() {
 }
 
 function editorValid() {
-  return $("account").reportValidity() && $("destination").reportValidity();
+  return $("account").reportValidity() && $("destination").reportValidity() && $("cleanup-value").reportValidity();
 }
 
 async function saveAccount() {
@@ -502,11 +582,15 @@ function deleteAccount(id) {
 /* ---------- folder browser ---------- */
 
 async function openBrowser(path) {
+  const request = ++browseRequest;
+  $("browse-pick").disabled = true;
   try {
     const listing = await api("browse" + (path ? "?path=" + encodeURIComponent(path) : ""));
-    renderBrowser(listing);
+    if (request === browseRequest) renderBrowser(listing);
   } catch (error) {
+    if (request !== browseRequest) return;
     if (path) return openBrowser("");
+    closeBrowser();
     showNotice(error.message);
   }
 }
@@ -526,6 +610,7 @@ function renderBrowser(listing) {
 }
 
 function closeBrowser() {
+  ++browseRequest;
   $("browser").hidden = true;
   $("browse-list").replaceChildren();
 }
@@ -544,7 +629,8 @@ function renderHistory(history) {
     el("td", { class: "ellipsis", title: item.account }, item.account),
     el("td", { class: "mode" }, (triggerLabels[item.trigger] || "—") + " · " + (item.full_scan ? "完整" : "快速")),
     el("td", { title: item.message || "" }, statusChip(item.status)),
-    el("td", { class: "num" }, (item.downloaded_estimate ? "≥" : "") + String(item.downloaded ?? 0)))));
+    el("td", { class: "num" }, (item.downloaded_estimate ? "≥" : "") + String(item.downloaded ?? 0)),
+    el("td", { class: "num" }, (item.downloaded_estimate && item.removed ? "≥" : "") + String(item.removed ?? 0)))));
 }
 
 /* ---------- notifications ---------- */
@@ -571,8 +657,8 @@ function renderNotify(notify) {
   const channelName = channelLabels[notify.channel];
   const events = EVENTS.filter((event) => notify.events?.[event]).map((event) => eventLabels[event]);
   $("notify-summary").textContent = !channelName
-    ? "未开启 · 可在 Apple 要求验证或下载失败时提醒"
-    : channelName + " · " + (events.length ? events.join("、") + "时提醒" : "未选择提醒事件");
+    ? "当前未开启"
+    : "当前：" + channelName + " · " + (events.length ? events.join("、") + "时提醒" : "未选择提醒事件");
   if (notifyDirty) return;
   $("channel").value = notify.channel;
   for (const field of NOTIFY_TEXT_FIELDS) $(field).value = notify[field] || "";
@@ -615,6 +701,59 @@ async function saveNotify() {
   for (const field of SECRET_FIELDS) $(field).value = "";
 }
 
+/* ---------- settings ---------- */
+
+function renderSettings() {
+  const settings = state.settings || {};
+  $("about-version").textContent = state.version ? "v" + state.version : "—";
+  $("about-downloader").textContent = state.downloader || "—";
+  $("about-roots").textContent = (state.roots || []).join("\n") || "—";
+  $("watch-fact-recent").textContent = watchSentence();
+  const watching = (state.accounts || []).filter((account) => account.watch).map((account) => account.account);
+  $("watch-accounts").textContent = watching.length
+    ? "已开启的账户：" + watching.join("、") + "。可在各账户的编辑页单独开关。"
+    : "目前没有账户开启实时检测。在账户的编辑页勾选「实时检测新照片」即可开启。";
+  $("watch-fields").disabled = busy;
+  if (watchDirty) return;
+  const choices = Array.isArray(settings.watch_choices) ? settings.watch_choices : [];
+  const group = $("watch-interval");
+  if (group.childElementCount !== choices.length) {
+    group.replaceChildren(...choices.map((minutes) => el("label", {},
+      el("input", { type: "radio", name: "watch-minutes", value: String(minutes) }),
+      el("span", {}, minutes + " 分钟"))));
+  }
+  setRadio("watch-minutes", String(settings.watch_minutes));
+}
+
+function setPauseMenu(open) {
+  $("pause-menu").hidden = !open;
+  $("pause").setAttribute("aria-expanded", String(open));
+}
+
+function currentView() {
+  const match = /^#settings(?:\/([a-z]+))?$/.exec(location.hash);
+  if (!match) return { view: "dashboard" };
+  return { view: "settings", section: SETTINGS_SECTIONS.includes(match[1]) ? match[1] : SETTINGS_SECTIONS[0] };
+}
+
+function applyView() {
+  const { view, section } = currentView();
+  const ready = Boolean(state);
+  $("dashboard").hidden = !ready || view !== "dashboard";
+  $("settings-view").hidden = !ready || view !== "settings";
+  $("open-settings").setAttribute("aria-pressed", String(view === "settings"));
+  $("add-account").hidden = !ready || view === "settings";
+  for (const link of document.querySelectorAll(".settings-nav a")) {
+    if (link.dataset.section === section) link.setAttribute("aria-current", "page");
+    else link.removeAttribute("aria-current");
+  }
+  for (const panel of document.querySelectorAll(".settings-panel")) panel.hidden = panel.dataset.section !== section;
+  const job = state?.job || {};
+  const waiting = view === "settings" && Boolean(verification[job.status]);
+  $("settings-alert").hidden = !waiting;
+  if (waiting) $("settings-alert-text").textContent = (job.account || "Apple 账户") + " 正在等待验证，完成后才能继续下载。";
+}
+
 /* ---------- refresh loop ---------- */
 
 function render(snapshot) {
@@ -623,9 +762,8 @@ function render(snapshot) {
     throw new Error("请使用飞牛管理员账户重新打开应用。");
   }
   state = snapshot;
-  $("dashboard").hidden = false;
-  $("notify-shortcut").hidden = false;
-  $("add-account").hidden = false;
+  $("open-settings").hidden = false;
+  applyView();
   const job = snapshot.job || {};
   renderSummary();
   renderChallenge(job);
@@ -633,6 +771,7 @@ function render(snapshot) {
   renderLog(job, snapshot.logs);
   renderHistory(snapshot.history);
   renderNotify(snapshot.notify || {});
+  renderSettings();
   updatePathHelp();
   $("notify-fields").disabled = busy;
 }
@@ -688,19 +827,56 @@ for (const id of ["editor-close", "editor-back"]) {
     $("add-account").focus({ preventScroll: true });
   });
 }
-$("notify-shortcut").addEventListener("click", () => {
-  const panel = $("notify-card");
-  panel.open = true;
-  const heading = panel.querySelector("summary");
-  heading.focus({ preventScroll: true });
-  heading.scrollIntoView({ block: "start" });
+$("open-settings").addEventListener("click", () => {
+  location.hash = currentView().view === "settings" ? "" : "#settings";
+});
+$("settings-back").addEventListener("click", () => { location.hash = ""; });
+$("settings-alert").querySelector("a").addEventListener("click", (event) => {
+  event.preventDefault();
+  location.hash = "";
+});
+window.addEventListener("hashchange", () => {
+  applyView();
+  window.scrollTo(0, 0);
 });
 $("cancel").addEventListener("click", () => act(() => api("cancel", {})));
+$("resume").addEventListener("click", () => act(() => api("resume", {})));
+$("pause").addEventListener("click", (event) => {
+  event.stopPropagation();
+  const open = $("pause-menu").hidden;
+  setPauseMenu(open);
+  if (open) $("pause-menu").querySelector("button").focus();
+});
+for (const item of $("pause-menu").querySelectorAll("[data-minutes]")) {
+  item.addEventListener("click", () => {
+    setPauseMenu(false);
+    act(() => api("pause", { minutes: Number(item.dataset.minutes) }));
+  });
+}
+$("pause-menu").addEventListener("keydown", (event) => {
+  const items = [...$("pause-menu").querySelectorAll("button")];
+  const index = items.indexOf(document.activeElement);
+  if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+    event.preventDefault();
+    items[(index + (event.key === "ArrowDown" ? 1 : items.length - 1)) % items.length].focus();
+  }
+});
+document.addEventListener("click", (event) => {
+  if (!$("pause-wrap").contains(event.target)) setPauseMenu(false);
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && !$("pause-menu").hidden) {
+    setPauseMenu(false);
+    $("pause").focus();
+  }
+});
 $("account").addEventListener("input", () => { resetSharedDestination(); updateSuggestedDestination(); });
 for (const input of document.getElementsByName("domain")) {
   input.addEventListener("change", () => { resetSharedDestination(); updateSuggestedDestination(); });
 }
 $("destination").addEventListener("input", () => { suggestDestination = false; resetSharedDestination(); });
+$("cleanup-mode").addEventListener("change", updateCleanupFields);
+$("include-shared").addEventListener("change", updateCleanupFields);
 $("account-form").addEventListener("submit", (event) => {
   event.preventDefault();
   if (!editorValid()) return;
@@ -728,6 +904,16 @@ $("browse-pick").addEventListener("click", () => {
 });
 
 $("notify-form").addEventListener("input", () => { notifyDirty = true; });
+$("watch-form").addEventListener("change", () => { watchDirty = true; $("watch-status").textContent = "有未保存的更改"; });
+$("watch-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  const minutes = Number(radioValue("watch-minutes"));
+  act(async () => {
+    await api("settings/save", { watch_minutes: minutes });
+    watchDirty = false;
+    $("watch-status").textContent = "已保存，新的间隔立即生效";
+  });
+});
 $("channel").addEventListener("change", updateChannelFields);
 $("notify-form").addEventListener("submit", (event) => {
   event.preventDefault();

@@ -48,6 +48,27 @@ class Hook:
 
 
 class ServiceTests(ServiceCase):
+    def test_cleanup_policy_is_per_account_and_defaults_to_off(self):
+        ident = self.add_account()
+        first = self.state()["accounts"][0]
+        self.assertEqual(first["cleanup"], {"mode": "off", "value": 0, "shared": False})
+        data = dict(id=ident, account=first["account"], destination=str(self.dest), domain="com", interval_hours=0)
+        for invalid in ({"mode": "latest", "value": 0}, {"mode": "days", "value": True},
+                        {"mode": "immediate", "shared": "yes"}, {"mode": "delete-all"}):
+            self.assertEqual(self.call("/api/accounts/save", dict(data, cleanup=invalid))[0], 400)
+        rule = {"mode": "latest", "value": 3, "shared": True}
+        self.assertEqual(self.call("/api/accounts/save", dict(data, include_shared=False, cleanup=rule))[0], 400)
+        self.assertEqual(self.call("/api/accounts/save", dict(data, cleanup=rule))[0], 200)
+        self.assertEqual(self.call("/api/accounts/save", data)[0], 200)
+        self.stop_service()
+        self.start_service()
+        self.assertEqual(self.state()["accounts"][0]["cleanup"], rule)
+        self.seed_session()
+        self.assertEqual(self.call("/api/start", {"id": ident})[0], 200)
+        self.wait_job("success")
+        self.assertEqual(self.state()["history"][0]["removed"], 0)
+        self.assertIn("预览", self.state()["history"][0]["message"])
+
     def seed_session(self, account="test@example.com", domain="com"):
         cookie = session_path(self.state_dir / "sessions", domain, account)
         cookie.mkdir(parents=True, exist_ok=True)
@@ -253,6 +274,39 @@ class ServiceTests(ServiceCase):
         self.assertEqual(self.call("/api/accounts/save", dict(payload, id=second, interval_hours=6))[0], 200)
         self.assertEqual(self.call("/api/accounts/save", dict(payload, id=second, account="other@example.com"))[0], 409)
 
+    def test_account_form_through_gateway_with_rewritten_host(self):
+        headers = {"Host": "gateway.internal", "X-Trim-Userid": "1000"}
+        status, snapshot = self.call("/api/state", extra_headers=headers)
+        self.assertEqual(status, 200)
+        data = dict(account="fixture@example.com", domain="com", destination=str(self.dest),
+                    interval_hours=0, _csrf=snapshot["csrf_token"])
+        for origin, metadata in (("https://nas.example:5667", {"Sec-Fetch-Site": "same-origin"}),
+                                 ("http://192.0.2.10:5666", {}), ("null", {})):
+            with self.subTest(origin=origin):
+                status, result = self.call("/api/accounts/save", data, origin=origin,
+                                           extra_headers={**headers, **metadata})
+                self.assertEqual(status, 200, result)
+                data["id"] = result["id"]
+        self.assertEqual(len(self.state()["accounts"]), 1)
+        self.assertNotIn(snapshot["csrf_token"], (self.state_dir / "archive.json").read_text())
+
+    def test_gateway_page_proof_remains_bound_to_the_admin_and_service(self):
+        headers = {"Host": "gateway.internal", "X-Trim-Userid": "1000"}
+        proof = self.call("/api/state", extra_headers=headers)[1]["csrf_token"]
+        def save(token, **extra):
+            data = dict(account="fixture@example.com", domain="com", destination=str(self.dest),
+                        interval_hours=0, _csrf=token)
+            return self.call("/api/accounts/save", data, extra_headers={**headers, **extra})[0]
+        self.assertEqual(save("expired"), 403)
+        self.assertEqual(save(proof, **{"X-Trim-Userid": "1001"}), 403)
+        self.assertEqual(save(proof, **{"X-Trim-Isadmin": "false"}), 403)
+        for site in ("cross-site", "same-site"):
+            self.assertEqual(save(proof, **{"Sec-Fetch-Site": site}), 403)
+        self.stop_service()
+        self.start_service()
+        self.assertEqual(save(proof), 403)
+        self.assertEqual(self.state()["accounts"], [])
+
     def test_gateway_destination_and_browse(self):
         self.assertEqual(self.socket.stat().st_mode & 0o777, 0o600)
         self.assertEqual(self.call("/api/state", admin="false")[0], 403)
@@ -336,6 +390,20 @@ class ArchiveConsistencyTests(unittest.TestCase):
         self.assertEqual(saved["version"], 2, "0.2.x can read the same envelope if the user rolls back")
         self.assertEqual(saved["verification_version"], archive_module.VERIFICATION_VERSION)
 
+    def test_050_upgrade_resets_deletion_and_paused_checkpoints(self):
+        old = dict(self.payload, id="account1", cleanup={"mode":"immediate","value":0,"shared":True},
+                   last_success=1234, last_full_scan=1234,
+                   resume={"full":True,"done":["PrimarySync"],"paused":True})
+        state = dict(version=2, verification_version=1, accounts=[old],
+                     job={"account_id":"account1","status":"paused","done_phases":["PrimarySync"]})
+        (self.state_dir / "archive.json").write_text(json.dumps(state))
+        app = self.archive()
+        self.assertEqual(app.accounts[0]["cleanup"]["mode"], "off")
+        self.assertTrue(app.accounts[0]["needs_full_scan"])
+        self.assertIsNone(app.accounts[0]["resume"])
+        self.assertEqual(app.job["done_phases"], [])
+        self.assertEqual(app.job["status"], "cancelled")
+
     def test_unknown_schema_is_preserved_byte_for_byte(self):
         data = b'{"version":99,"config":{},"accounts":[{"id":"keep"}]}'
         path = self.state_dir / "archive.json"
@@ -344,13 +412,34 @@ class ArchiveConsistencyTests(unittest.TestCase):
             self.archive()
         self.assertEqual(path.read_bytes(), data)
 
+    def test_paused_job_survives_failed_cancel_and_continue(self):
+        archive = self.archive()
+        account = archive.find(archive.save_account(self.payload))
+        archive.media_count = 3
+        archive.job.update(account_id=account["id"], trigger="manual", done_phases=["PrimarySync"])
+        archive.pause_minutes = 30
+        archive._record_pause(account, full=True, probe=False)
+        archive.persist()
+        saved = json.loads(archive.file.read_text())
+        for action, error in [(archive.stop, OSError), (archive.resume_paused, archive_module.RequestError)]:
+            with self.subTest(action=action.__name__), mock.patch.object(archive, "persist", side_effect=OSError("full")):
+                with self.assertRaises(error):
+                    action()
+                self.assertEqual(archive.job["status"], "paused")
+                self.assertEqual(archive.job["pause_until"], saved["job"]["pause_until"])
+                self.assertEqual(account, saved["accounts"][0])
+                self.assertEqual(list(archive.history), saved["history"])
+        archive.stop()
+        self.assertEqual(archive.history[-1]["downloaded"], 3)
+        self.assertEqual(len(archive.history), 1)
+
     def test_failed_quick_scan_forces_full_until_success(self):
         archive = self.archive()
         account = archive.find(archive.save_account(self.payload))
         baseline = time.time() - 3600
         account.update(last_full_scan=baseline, last_success=baseline)
         self.assertFalse(archive._wants_full_scan(account, "schedule", None))
-        result = mock.Mock(downloaded=0, warnings=[], failures=["私密照片名.HEIC 缺少原件。"])
+        result = mock.Mock(downloaded=0, warnings=[], review="", failures=["私密照片名.HEIC 缺少原件。"])
         with mock.patch.object(archive_module, "run_sync", return_value=result), mock.patch.object(archive, "notify") as notify:
             archive.download(account, self.dest, False)
         self.assertIn("私密照片名", archive.job["message"])

@@ -6,10 +6,12 @@ gateway forwards to. Account and download logic lives in archive.py.
 import fcntl
 from functools import lru_cache
 import hashlib
+import hmac
 from http.server import BaseHTTPRequestHandler
 import json
 import os
 from pathlib import Path
+import secrets
 import signal
 import socketserver
 import stat
@@ -75,6 +77,28 @@ class Handler(BaseHTTPRequestHandler):
             raise RequestError("页面不存在。", 404)
         return path[len(prefix):]
 
+    def csrf_token(self):
+        # The gateway authenticates the administrator, but may rewrite the HTTP Host.
+        # A page can read this token through the authenticated, same-origin state API.
+        uid = self.headers.get("X-Trim-Userid", "")
+        username = self.headers.get("X-Trim-Username", "")
+        identity = json.dumps([uid, username], ensure_ascii=True).encode("ascii")
+        return hmac.digest(self.server.csrf_key, identity, "sha256").hex()
+
+    def validate_write(self, data):
+        if "_csrf" in data:
+            token = data.pop("_csrf")
+            if not isinstance(token, str) or not token.isascii() or not hmac.compare_digest(token, self.csrf_token()):
+                raise RequestError("页面验证已过期，请刷新应用后重试。", 403)
+            return
+        # Existing API clients can still submit directly using the original host check.
+        origin = self.headers.get("Origin")
+        if origin:
+            parts = urlsplit(origin)
+            if parts.scheme not in ("http", "https") or not parts.netloc or parts.netloc not in (
+                    self.headers.get("Host"), self.headers.get("X-Forwarded-Host")):
+                raise RequestError("请求来源与飞牛访问地址不一致，请重新打开应用后重试。", 403)
+
     def do_GET(self):
         try:
             path = self.path_in_app()
@@ -82,7 +106,7 @@ class Handler(BaseHTTPRequestHandler):
             if not path:
                 self.send(302, b"", headers={"Location": self.server.prefix + "/"})
             elif path == "/api/state":
-                self.send(200, archive.state())
+                self.send(200, dict(archive.state(), csrf_token=self.csrf_token()))
             elif path == "/api/browse":
                 query = parse_qs(urlsplit(self.path).query)
                 value = query.get("path", [""])[0]
@@ -114,18 +138,15 @@ class Handler(BaseHTTPRequestHandler):
             path = self.path_in_app()
             if self.headers.get("X-Requested-With") != "XMLHttpRequest" or self.headers.get_content_type() != "application/json":
                 raise RequestError("请求格式无效。", 403)
-            if self.headers.get("Sec-Fetch-Site") == "cross-site":
+            if self.headers.get("Sec-Fetch-Site") in ("same-site", "cross-site"):
                 raise RequestError("请从飞牛应用页面提交请求。", 403)
-            origin = self.headers.get("Origin")
-            if origin and (urlsplit(origin).scheme not in ("http", "https") or urlsplit(origin).netloc not in
-                           (self.headers.get("Host"), self.headers.get("X-Forwarded-Host"))):
-                raise RequestError("请求来源与飞牛访问地址不一致。", 403)
             length = int(self.headers.get("Content-Length", "0"))
             if not 1 <= length <= 16384:
                 raise RequestError("请求大小无效。", 413)
             data = json.loads(self.rfile.read(length))
             if not isinstance(data, dict):
                 raise RequestError("请求格式无效。")
+            self.validate_write(data)
             archive = self.server.archive
             result = {}
             if path == "/api/accounts/save":
@@ -136,6 +157,12 @@ class Handler(BaseHTTPRequestHandler):
                 archive.start(data.get("id"), "manual")
             elif path == "/api/cancel":
                 archive.stop()
+            elif path == "/api/pause":
+                archive.pause(data)
+            elif path == "/api/resume":
+                archive.resume_paused()
+            elif path == "/api/settings/save":
+                archive.save_settings(data)
             elif path == "/api/input":
                 archive.submit(data)
             elif path == "/api/notify/save":
@@ -185,6 +212,7 @@ def main():
             # lives under the separate 0700 directory established above.
             os.umask(0o022)
             server.prefix = os.environ.get("ICLOUD_PREFIX", "/app/icloud-photos").rstrip("/")
+            server.csrf_key = secrets.token_bytes(32)
             server.archive = Archive(
                 state, os.environ["ICLOUDPD_BIN"], roots, default_dir,
                 version=os.environ.get("ICLOUD_APP_VERSION", ""),

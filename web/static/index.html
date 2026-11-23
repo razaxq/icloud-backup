@@ -27,6 +27,9 @@
     <symbol id="i-up" viewBox="0 0 24 24"><path d="M12 19V5m-6 6 6-6 6 6"/></symbol>
     <symbol id="i-back" viewBox="0 0 24 24"><path d="M19 12H5m6-6-6 6 6 6"/></symbol>
     <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 8v4.5M12 16h.01"/></symbol>
+    <symbol id="i-pause" viewBox="0 0 24 24"><path d="M9 5.5v13M15 5.5v13"/></symbol>
+    <symbol id="i-radar" viewBox="0 0 24 24"><circle cx="12" cy="12" r="2"/><path d="M7.8 16.2a6 6 0 0 1 0-8.4m8.4 0a6 6 0 0 1 0 8.4M5 19a10 10 0 0 1 0-14m14 0a10 10 0 0 1 0 14"/></symbol>
+    <symbol id="i-gear" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2.8v2.4m0 13.6v2.4M5.5 5.5l1.7 1.7m9.6 9.6 1.7 1.7M2.8 12h2.4m13.6 0h2.4M5.5 18.5l1.7-1.7m9.6-9.6 1.7-1.7"/></symbol>
     <symbol id="i-lock" viewBox="0 0 24 24"><rect x="5" y="10.5" width="14" height="10" rx="2.5"/><path d="M8.5 10.5V8a3.5 3.5 0 0 1 7 0v2.5"/></symbol>
   </svg>
 
@@ -36,7 +39,7 @@
       <span class="app-name"><span lang="en">iCloud</span> 照片归档</span>
       <span class="version" id="version"></span>
       <div class="top-actions">
-        <button class="btn ghost" id="notify-shortcut" type="button" aria-controls="notify-card" aria-label="通知设置" hidden><svg class="icon" aria-hidden="true"><use href="#i-bell"/></svg><span class="label-wide">通知设置</span></button>
+        <button class="btn ghost" id="open-settings" type="button" aria-label="设置" aria-pressed="false" hidden><svg class="icon" aria-hidden="true"><use href="#i-gear"/></svg><span class="label-wide">设置</span></button>
         <button class="btn primary" id="add-account" type="button" aria-controls="editor" aria-label="添加账户" hidden><svg class="icon" aria-hidden="true"><use href="#i-plus"/></svg><span class="label-narrow">添加账户</span></button>
       </div>
     </div>
@@ -76,7 +79,16 @@
             <p class="hero-sub" id="hero-sub"></p>
           </div>
           <div class="activity-bar" id="job-bar" aria-hidden="true" hidden><i></i></div>
-          <div class="hero-actions" id="hero-actions">
+          <div class="hero-actions" id="hero-actions" hidden>
+            <button id="resume" class="btn primary sm" type="button" hidden><svg class="icon" aria-hidden="true"><use href="#i-play"/></svg>继续</button>
+            <div class="menu-wrap" id="pause-wrap" hidden>
+              <button id="pause" class="btn ghost sm" type="button" aria-haspopup="menu" aria-expanded="false" aria-controls="pause-menu"><svg class="icon" aria-hidden="true"><use href="#i-pause"/></svg><span id="pause-label">暂停</span><svg class="icon caret" aria-hidden="true"><use href="#i-chevron"/></svg></button>
+              <div class="menu" id="pause-menu" role="menu" aria-label="暂停时长" hidden>
+                <button type="button" role="menuitem" data-minutes="30">暂停 30 分钟</button>
+                <button type="button" role="menuitem" data-minutes="120">暂停 2 小时</button>
+                <button type="button" role="menuitem" data-minutes="0">暂停，直到手动继续</button>
+              </div>
+            </div>
             <button id="cancel" class="btn danger sm" type="button" hidden>取消任务</button>
           </div>
         </div>
@@ -105,7 +117,7 @@
           <div class="editor-head">
             <button type="button" class="btn text sm back" id="editor-back"><svg class="icon" aria-hidden="true"><use href="#i-back"/></svg>返回</button>
             <h2 id="editor-title">添加账户</h2>
-            <p class="hint">原图、实况照片视频与 RAW 伴随文件按拍摄日期归入「年/月」，单向下载，不会删除 iCloud 上的内容。</p>
+            <p class="hint">原图、实况照片视频与 RAW 伴随文件按拍摄日期归入「年/月」。本版本保留所有 iCloud 原件。</p>
           </div>
           <form id="account-form" novalidate>
             <fieldset id="account-fields">
@@ -162,7 +174,7 @@
               <fieldset class="section">
                 <div class="section-head">
                   <legend>自动下载</legend>
-                  <p class="hint">手动开始的下载始终完整扫描。服务中断后的自动续传沿用中断前的扫描方式。</p>
+                  <p class="hint">手动开始的下载始终完整扫描。暂停或服务中断后，任务从未完成的图库接着下载。</p>
                 </div>
                 <div class="section-body">
                   <div class="field">
@@ -171,7 +183,7 @@
                       <option value="0">关闭，仅手动下载</option><option value="1">每 1 小时</option><option value="6">每 6 小时</option><option value="12">每 12 小时</option><option value="24">每 24 小时</option><option value="168">每 7 天</option>
                     </select>
                   </div>
-                  <div class="field">
+                  <div class="field" id="scan-options">
                     <span class="field-label" id="scan-label">定时任务的扫描方式</span>
                     <div class="choices" role="radiogroup" aria-labelledby="scan-label">
                       <label class="choice"><input type="radio" name="scan" value="auto" checked><span><strong>快速检查 <em>推荐</em></strong><span class="hint">从最新项目开始，遇到连续已归档的项目即结束。每 7 天完整扫描一次。</span></span></label>
@@ -179,9 +191,38 @@
                     </div>
                   </div>
                   <label class="check"><input type="checkbox" id="include-shared" checked> 同时下载 iCloud 共享照片图库</label>
+                  <div class="toggle-block">
+                    <label class="check"><input type="checkbox" id="watch" aria-describedby="watch-hint"> 实时检测新照片</label>
+                    <p class="hint" id="watch-hint"></p>
+                  </div>
                 </div>
               </fieldset>
 
+              <fieldset class="section">
+                <div class="section-head">
+                  <legend>iCloud 保留策略预览</legend>
+                  <p class="hint">完整扫描后列出符合策略的项目。此版本保留全部 iCloud 原件。</p>
+                </div>
+                <div class="section-body">
+                  <div class="field">
+                    <label for="cleanup-mode">iCloud 保留策略</label>
+                    <select id="cleanup-mode">
+                      <option value="off">保留全部原件</option>
+                      <option value="immediate">预览全部已备份项目</option>
+                      <option value="days">预览拍摄于 X 天前的项目</option>
+                      <option value="latest">预览保留最近 X 项后的其余项目</option>
+                    </select>
+                  </div>
+                  <div id="cleanup-amount" class="field" hidden>
+                    <label id="cleanup-label" for="cleanup-value">保留数量</label>
+                    <input id="cleanup-value" type="number" min="1" max="1000000" step="1" required disabled>
+                  </div>
+                  <div id="cleanup-details" hidden>
+                    <p class="callout warn">候选数量显示在任务结果中，逐项清单保存在保存目录的 .icloud-archive 文件夹内。</p>
+                    <label class="check" id="cleanup-shared-label"><input id="cleanup-shared" type="checkbox"> 预览时包含已备份的共享图库</label>
+                  </div>
+                </div>
+              </fieldset>
               <div class="form-footer">
                 <button type="button" class="btn text" id="editor-close">取消</button>
                 <span class="spacer"></span>
@@ -215,84 +256,140 @@
         </div>
         <div class="table-wrap" id="history-wrap" hidden>
           <table class="history" id="history">
-            <thead><tr><th scope="col">完成时间</th><th scope="col">账户</th><th scope="col">方式</th><th scope="col">结果</th><th scope="col" class="num">新增</th></tr></thead>
+            <thead><tr><th scope="col">完成时间</th><th scope="col">账户</th><th scope="col">方式</th><th scope="col">结果</th><th scope="col" class="num">新增</th><th scope="col" class="num">云端删除</th></tr></thead>
             <tbody></tbody>
           </table>
         </div>
         <p class="hint panel-empty" id="no-history">完成的任务会显示在这里。</p>
       </section>
 
-      <details class="panel notify" id="notify-card">
-        <summary>
-          <span class="notify-icon" aria-hidden="true"><svg class="icon"><use href="#i-bell"/></svg></span>
-          <span class="notify-title"><strong>通知</strong><span class="hint" id="notify-summary">未开启</span></span>
-          <span class="chip" id="notify-last" hidden></span>
-          <svg class="icon disclosure" aria-hidden="true"><use href="#i-chevron"/></svg>
-        </summary>
-        <div class="notify-body">
-          <p class="hint">无人查看此页面时，可在 Apple 要求验证或下载失败时收到提醒。</p>
-          <form id="notify-form" novalidate>
-            <fieldset id="notify-fields">
-              <div class="form-grid">
+    </div>
+
+    <div id="settings-view" class="settings-view" hidden>
+      <div class="settings-head">
+        <button type="button" class="btn text sm back" id="settings-back"><svg class="icon" aria-hidden="true"><use href="#i-back"/></svg>返回</button>
+        <h1>设置</h1>
+      </div>
+      <div id="settings-alert" class="banner settings-alert" role="status" hidden>
+        <svg class="icon" aria-hidden="true"><use href="#i-lock"/></svg><span id="settings-alert-text"></span>
+        <a href="#" class="btn primary sm">前往验证</a>
+      </div>
+      <div class="settings-layout">
+        <nav class="settings-nav" aria-label="设置分类">
+          <a href="#settings/notify" data-section="notify"><svg class="icon" aria-hidden="true"><use href="#i-bell"/></svg>通知</a>
+          <a href="#settings/watch" data-section="watch"><svg class="icon" aria-hidden="true"><use href="#i-radar"/></svg>实时检测</a>
+          <a href="#settings/about" data-section="about"><svg class="icon" aria-hidden="true"><use href="#i-info"/></svg>关于</a>
+        </nav>
+
+        <section class="panel settings-panel" data-section="notify" aria-labelledby="notify-heading">
+          <div class="panel-head">
+            <div><h2 id="notify-heading">通知</h2><p class="hint" id="notify-summary">未开启</p></div>
+            <span class="chip" id="notify-last" hidden></span>
+          </div>
+          <div class="settings-body">
+            <p class="hint">无人查看此页面时，可在 Apple 要求验证或下载失败时收到提醒。</p>
+                <form id="notify-form" novalidate>
+                  <fieldset id="notify-fields">
+                    <div class="form-grid">
+                      <div class="field">
+                        <label for="channel">通知方式</label>
+                        <select id="channel">
+                          <option value="none">不发送通知</option>
+                          <option value="webhook">通用 Webhook（JSON）</option>
+                          <option value="bark">Bark</option>
+                          <option value="ntfy">ntfy</option>
+                          <option value="telegram">Telegram 机器人</option>
+                          <option value="smtp">邮件（SMTP）</option>
+                        </select>
+                      </div>
+                    </div>
+                    <div data-channel="webhook" class="form-grid" hidden>
+                      <div class="field wide"><label for="webhook_url">Webhook 地址</label><input id="webhook_url" data-secret type="text" spellcheck="false" autocomplete="off" placeholder="https://example.com/hooks/…"><p class="hint">以 POST 发送 JSON：app、event、title、message、time。</p></div>
+                    </div>
+                    <div data-channel="bark" class="form-grid" hidden>
+                      <div class="field wide"><label for="bark_url">Bark 推送地址</label><input id="bark_url" data-secret type="text" spellcheck="false" autocomplete="off" placeholder="https://api.day.app/你的设备密钥"></div>
+                    </div>
+                    <div data-channel="ntfy" class="form-grid" hidden>
+                      <div class="field"><label for="ntfy_url">主题地址</label><input id="ntfy_url" data-secret type="text" spellcheck="false" autocomplete="off" placeholder="https://ntfy.sh/my-photos"></div>
+                      <div class="field"><label for="ntfy_token">访问令牌（可选）</label><input id="ntfy_token" data-secret type="password" autocomplete="new-password" placeholder="tk_…"></div>
+                      <label class="check wide" hidden><input type="checkbox" data-clear-secret="ntfy_token"> 移除已保存的访问令牌</label>
+                      <p class="hint wide">更换推送服务器后，如需认证，请重新输入令牌。</p>
+                    </div>
+                    <div data-channel="telegram" class="form-grid" hidden>
+                      <div class="field"><label for="telegram_token">机器人令牌</label><input id="telegram_token" data-secret type="password" autocomplete="new-password" placeholder="123456:ABC…"></div>
+                      <div class="field"><label for="telegram_chat">会话 ID</label><input id="telegram_chat" type="text" spellcheck="false" autocomplete="off" placeholder="123456789 或 @channel"></div>
+                    </div>
+                    <div data-channel="smtp" class="form-grid" hidden>
+                      <div class="field"><label for="smtp_host">SMTP 服务器</label><input id="smtp_host" type="text" spellcheck="false" autocomplete="off" placeholder="smtp.example.com"></div>
+                      <div class="form-grid tight">
+                        <div class="field"><label for="smtp_port">端口</label><input id="smtp_port" type="number" min="1" max="65535" value="465"></div>
+                        <div class="field"><label for="smtp_security">加密</label><select id="smtp_security"><option value="ssl">SSL/TLS</option><option value="starttls">STARTTLS</option><option value="none">不加密</option></select></div>
+                      </div>
+                      <div class="field"><label for="smtp_user">用户名</label><input id="smtp_user" type="text" spellcheck="false" autocomplete="off"></div>
+                      <div class="field"><label for="smtp_password">密码或授权码</label><input id="smtp_password" data-secret type="password" autocomplete="new-password"></div>
+                      <div class="field"><label for="smtp_from">发件邮箱</label><input id="smtp_from" type="text" spellcheck="false" autocomplete="off" placeholder="留空时使用用户名"></div>
+                      <div class="field"><label for="smtp_to">收件邮箱</label><input id="smtp_to" type="text" spellcheck="false" autocomplete="off" placeholder="可填多个，用逗号分隔"></div>
+                      <label class="check wide" hidden><input type="checkbox" data-clear-secret="smtp_password"> 移除已保存的邮件密码</label>
+                      <p class="hint wide">修改服务器、端口、加密方式或用户名时，请重新填写密码。使用匿名发送时，清空用户名并移除密码。</p>
+                    </div>
+                    <div id="notify-events" class="events" hidden>
+                      <span class="field-label">发送以下通知</span>
+                      <label class="check"><input type="checkbox" data-event="auth"> 需要输入 Apple 密码或验证码</label>
+                      <label class="check"><input type="checkbox" data-event="error"> 任务未能完成</label>
+                      <label class="check"><input type="checkbox" data-event="partial"> 完成但有提醒</label>
+                      <label class="check"><input type="checkbox" data-event="success"> 每次成功完成</label>
+                    </div>
+                    <p class="hint" id="secret-help" hidden>已保存的地址和令牌不会显示在页面上，相应输入框留空即可保持不变。选择“不发送通知”并保存会清除它们。</p>
+                    <div class="form-footer">
+                      <span id="notify-status" class="hint" role="status"></span>
+                      <span class="spacer"></span>
+                      <button type="button" class="btn ghost" id="notify-test">发送测试通知</button>
+                      <button type="submit" class="btn primary" id="notify-save">保存通知设置</button>
+                    </div>
+                  </fieldset>
+                </form>
+          </div>
+        </section>
+
+        <section class="panel settings-panel" data-section="watch" aria-labelledby="watch-heading" hidden>
+          <div class="panel-head">
+            <div><h2 id="watch-heading">实时检测</h2><p class="hint">Apple 没有向第三方应用开放 iCloud 照片的变更推送，应用通过频繁、轻量的检测接近实时。</p></div>
+          </div>
+          <div class="settings-body">
+            <form id="watch-form" novalidate>
+              <fieldset id="watch-fields">
                 <div class="field">
-                  <label for="channel">通知方式</label>
-                  <select id="channel">
-                    <option value="none">不发送通知</option>
-                    <option value="webhook">通用 Webhook（JSON）</option>
-                    <option value="bark">Bark</option>
-                    <option value="ntfy">ntfy</option>
-                    <option value="telegram">Telegram 机器人</option>
-                    <option value="smtp">邮件（SMTP）</option>
-                  </select>
+                  <span class="field-label" id="watch-interval-label">检测间隔</span>
+                  <div class="segmented" role="radiogroup" aria-labelledby="watch-interval-label" id="watch-interval"></div>
                 </div>
-              </div>
-              <div data-channel="webhook" class="form-grid" hidden>
-                <div class="field wide"><label for="webhook_url">Webhook 地址</label><input id="webhook_url" data-secret type="text" spellcheck="false" autocomplete="off" placeholder="https://example.com/hooks/…"><p class="hint">以 POST 发送 JSON：app、event、title、message、time。</p></div>
-              </div>
-              <div data-channel="bark" class="form-grid" hidden>
-                <div class="field wide"><label for="bark_url">Bark 推送地址</label><input id="bark_url" data-secret type="text" spellcheck="false" autocomplete="off" placeholder="https://api.day.app/你的设备密钥"></div>
-              </div>
-              <div data-channel="ntfy" class="form-grid" hidden>
-                <div class="field"><label for="ntfy_url">主题地址</label><input id="ntfy_url" data-secret type="text" spellcheck="false" autocomplete="off" placeholder="https://ntfy.sh/my-photos"></div>
-                <div class="field"><label for="ntfy_token">访问令牌（可选）</label><input id="ntfy_token" data-secret type="password" autocomplete="new-password" placeholder="tk_…"></div>
-                <label class="check wide" hidden><input type="checkbox" data-clear-secret="ntfy_token"> 移除已保存的访问令牌</label>
-                <p class="hint wide">更换推送服务器后，如需认证，请重新输入令牌。</p>
-              </div>
-              <div data-channel="telegram" class="form-grid" hidden>
-                <div class="field"><label for="telegram_token">机器人令牌</label><input id="telegram_token" data-secret type="password" autocomplete="new-password" placeholder="123456:ABC…"></div>
-                <div class="field"><label for="telegram_chat">会话 ID</label><input id="telegram_chat" type="text" spellcheck="false" autocomplete="off" placeholder="123456789 或 @channel"></div>
-              </div>
-              <div data-channel="smtp" class="form-grid" hidden>
-                <div class="field"><label for="smtp_host">SMTP 服务器</label><input id="smtp_host" type="text" spellcheck="false" autocomplete="off" placeholder="smtp.example.com"></div>
-                <div class="form-grid tight">
-                  <div class="field"><label for="smtp_port">端口</label><input id="smtp_port" type="number" min="1" max="65535" value="465"></div>
-                  <div class="field"><label for="smtp_security">加密</label><select id="smtp_security"><option value="ssl">SSL/TLS</option><option value="starttls">STARTTLS</option><option value="none">不加密</option></select></div>
+                <ul class="plain-list" id="watch-facts">
+                  <li id="watch-fact-recent"></li>
+                  <li>检测只比对文件是否存在及大小，不读取照片内容。没有新照片时不会写入运行记录和任务历史。</li>
+                  <li>拍摄时间较早的导入照片排在图库后面，会在下次定时扫描或每周完整扫描时补齐。</li>
+                  <li>检测失败时自动延长间隔。Apple 要求重新验证时暂停检测，下次手动或定时下载完成验证后自动恢复。</li>
+                </ul>
+                <p class="callout"><svg class="icon" aria-hidden="true"><use href="#i-info"/></svg><span id="watch-accounts"></span></p>
+                <div class="form-footer">
+                  <span id="watch-status" class="hint" role="status"></span>
+                  <span class="spacer"></span>
+                  <button type="submit" class="btn primary" id="watch-save">保存</button>
                 </div>
-                <div class="field"><label for="smtp_user">用户名</label><input id="smtp_user" type="text" spellcheck="false" autocomplete="off"></div>
-                <div class="field"><label for="smtp_password">密码或授权码</label><input id="smtp_password" data-secret type="password" autocomplete="new-password"></div>
-                <div class="field"><label for="smtp_from">发件邮箱</label><input id="smtp_from" type="text" spellcheck="false" autocomplete="off" placeholder="留空时使用用户名"></div>
-                <div class="field"><label for="smtp_to">收件邮箱</label><input id="smtp_to" type="text" spellcheck="false" autocomplete="off" placeholder="可填多个，用逗号分隔"></div>
-                <label class="check wide" hidden><input type="checkbox" data-clear-secret="smtp_password"> 移除已保存的邮件密码</label>
-                <p class="hint wide">修改服务器、端口、加密方式或用户名时，请重新填写密码。使用匿名发送时，清空用户名并移除密码。</p>
-              </div>
-              <div id="notify-events" class="events" hidden>
-                <span class="field-label">发送以下通知</span>
-                <label class="check"><input type="checkbox" data-event="auth"> 需要输入 Apple 密码或验证码</label>
-                <label class="check"><input type="checkbox" data-event="error"> 任务未能完成</label>
-                <label class="check"><input type="checkbox" data-event="partial"> 完成但有提醒</label>
-                <label class="check"><input type="checkbox" data-event="success"> 每次成功完成</label>
-              </div>
-              <p class="hint" id="secret-help" hidden>已保存的地址和令牌不会显示在页面上，相应输入框留空即可保持不变。选择“不发送通知”并保存会清除它们。</p>
-              <div class="form-footer">
-                <span id="notify-status" class="hint" role="status"></span>
-                <span class="spacer"></span>
-                <button type="button" class="btn ghost" id="notify-test">发送测试通知</button>
-                <button type="submit" class="btn primary" id="notify-save">保存通知设置</button>
-              </div>
-            </fieldset>
-          </form>
-        </div>
-      </details>
+              </fieldset>
+            </form>
+          </div>
+        </section>
+
+        <section class="panel settings-panel" data-section="about" aria-labelledby="about-heading" hidden>
+          <div class="panel-head"><h2 id="about-heading">关于</h2></div>
+          <dl class="about-list">
+            <div><dt>应用版本</dt><dd id="about-version">—</dd></div>
+            <div><dt>下载引擎</dt><dd id="about-downloader">—</dd></div>
+            <div><dt>可用目录</dt><dd id="about-roots" class="mono">—</dd></div>
+            <div><dt>开发者</dt><dd><a href="https://blog.dtft.net/about" target="_blank" rel="noopener noreferrer">Ramos</a></dd></div>
+            <div><dt>开源许可</dt><dd>icloudpd（MIT 许可证）、Inter 字体（SIL Open Font License 1.1）</dd></div>
+          </dl>
+        </section>
+      </div>
     </div>
   </main>
 </body>

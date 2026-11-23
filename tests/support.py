@@ -27,10 +27,11 @@ class UnixConnection(http.client.HTTPConnection):
         self.sock.connect(str(self.socket_path))
 
 
-def request(socket_path, path, data=None, admin="true", origin="https://fnos.local"):
+def request(socket_path, path, data=None, admin="true", origin="https://fnos.local", extra_headers=None):
     conn = UnixConnection(socket_path)
     headers = {"X-Trim-Isadmin": admin, "X-Requested-With": "XMLHttpRequest", "Origin": origin,
                "Content-Type": "application/json"}
+    headers.update(extra_headers or {})
     try:
         conn.request("GET" if data is None else "POST", PREFIX + path,
                      None if data is None else json.dumps(data), headers)

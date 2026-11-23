@@ -89,8 +89,13 @@ class AssetIntegrityTests(unittest.TestCase):
         self.folder = Path(tmp.name).resolve()
         self.Asset, self.Live = Asset, Live
         self.photo = SimpleNamespace(
-            _asset_record={"fields": {}}, _master_record={"fields": {}}, item_type=AssetItemType.IMAGE,
+            _asset_record={"recordName": "asset-1", "recordChangeTag": "asset-v1", "fields": {}},
+            _master_record={"recordName": "master", "recordChangeTag": "master-v1", "fields": {}},
+            calculate_filename=lambda: "IMG.HEIC", item_type=AssetItemType.IMAGE,
             versions={}, created=dt.datetime(2020, 4, 15, 12, tzinfo=dt.timezone.utc))
+        library = SimpleNamespace(zone_id={"zoneName": "PrimarySync"}, library_type="private")
+        self.client = SimpleNamespace(domain="com", params={"dsid": "account1"}, photos=SimpleNamespace(
+            private_libraries={"PrimarySync": library}, shared_libraries={}))
         self.payloads = {}
         self.archive = strict_cli.StrictArchive()
 
@@ -104,7 +109,7 @@ class AssetIntegrityTests(unittest.TestCase):
         from pyicloud_ipd.file_match import FileMatchPolicy
         from pyicloud_ipd.raw_policy import RawTreatmentPolicy
         def write(logger, dry_run, icloud, photo, path, version, size, builder):
-            Path(path).write_bytes(self.payloads[size])
+            Path(path).write_bytes(self.payloads[version.url] if version.url in self.payloads else self.payloads[size])
             return True
         self.log = io.StringIO()
         with redirect_stdout(self.log), patch("icloudpd.download.download_media", side_effect=write):
@@ -112,7 +117,7 @@ class AssetIntegrityTests(unittest.TestCase):
                                 [self.Asset.ORIGINAL, self.Asset.ALTERNATIVE, self.Asset.ADJUSTED], False,
                                 False, False, False, self.Live.ORIGINAL, False, FileMatchPolicy.NAME_ID7,
                                 True, base.lp_filename_original, lambda _: "IMG_1234567.HEIC", RawTreatmentPolicy.AS_IS,
-                                None, Counter(), self.photo)
+                                self.client, Counter(), self.photo)
 
     def issues(self):
         return [json.loads(line[len(strict_cli.PROTOCOL):])[0] for line in self.log.getvalue().splitlines()]
@@ -122,7 +127,7 @@ class AssetIntegrityTests(unittest.TestCase):
         self.provide(self.Live.ORIGINAL, b"full movie", "com.apple.quicktime-movie")
         self.provide(self.Asset.ALTERNATIVE, b"camera raw", "com.adobe.raw-image")
         self.assertTrue(self.archive_one().present)
-        month = self.folder / "2020/04"
+        month = next(self.folder.glob("2020/04/*/*/manifest.json")).parent
         for ext, data in (("HEIC", b"full still"), ("MOV", b"full movie"), ("DNG", b"camera raw")):
             self.assertEqual((month / f"IMG_1234567.{ext}").read_bytes(), data)
         self.assertFalse(self.archive_one().downloaded)
@@ -133,15 +138,15 @@ class AssetIntegrityTests(unittest.TestCase):
         self.provide(self.Live.MEDIUM, b"smaller movie", "com.apple.quicktime-movie")
         self.assertFalse(self.archive_one().present)
         self.assertEqual(self.issues(), ["live"])
-        self.assertFalse((self.folder / "2020/04/IMG_1234567.MOV").exists())
-        self.assertEqual((self.folder / "2020/04/IMG_1234567-preview-medium.MOV").read_bytes(), b"smaller movie")
+        self.assertFalse(list(self.folder.rglob("IMG_1234567.MOV")))
+        self.assertEqual(next(self.folder.rglob("IMG_1234567-preview-medium.MOV")).read_bytes(), b"smaller movie")
 
     def test_live_flag_without_any_video_and_thumbnail_only_still_fail(self):
         self.photo._asset_record["fields"]["assetSubtypeV2"] = {"value": 2}
         self.provide(self.Asset.THUMB, b"small still", "public.jpeg")
         self.assertFalse(self.archive_one().present)
         self.assertEqual(self.issues(), ["original", "live"])
-        self.assertEqual((self.folder / "2020/04/IMG_1234567-preview-thumb.JPG").read_bytes(), b"small still")
+        self.assertEqual(next(self.folder.rglob("IMG_1234567-preview-thumb.JPG")).read_bytes(), b"small still")
         self.assertFalse(list(self.folder.rglob("*.HEIC")))
 
     def test_mismatched_original_bytes_fail_even_if_the_filename_and_size_match(self):
@@ -150,3 +155,102 @@ class AssetIntegrityTests(unittest.TestCase):
         self.assertFalse(self.archive_one().present)
         self.assertEqual(self.issues(), ["mismatch"])
         self.assertFalse(list(self.folder.rglob("*.HEIC")))
+
+
+@unittest.skipUnless(importlib.util.find_spec("icloudpd"), "requires packaged icloudpd 1.33.0")
+class RealTimeProbeTests(unittest.TestCase):
+    """--only-print-filenames: report what is missing using file metadata only."""
+
+    setUp = AssetIntegrityTests.setUp
+    provide = AssetIntegrityTests.provide
+    archive_one = AssetIntegrityTests.archive_one
+
+    def probe_one(self):
+        from icloudpd import base
+        from icloudpd.counter import Counter
+        from pyicloud_ipd.file_match import FileMatchPolicy
+        from pyicloud_ipd.raw_policy import RawTreatmentPolicy
+        self.log = io.StringIO()
+        no_reads = patch.object(Path, "open", side_effect=AssertionError("a probe must not read photo bodies"))
+        no_downloads = patch("icloudpd.download.download_media", side_effect=AssertionError("probe downloaded"))
+        with redirect_stdout(self.log), no_reads, no_downloads:
+            return strict_cli.ProbeArchive()(
+                logging.getLogger("probe-test"), "{:%Y/%m}", str(self.folder),
+                [self.Asset.ORIGINAL, self.Asset.ALTERNATIVE, self.Asset.ADJUSTED], False,
+                True, False, False, self.Live.ORIGINAL, False, FileMatchPolicy.NAME_ID7,
+                True, base.lp_filename_original, lambda _: "IMG_1234567.HEIC", RawTreatmentPolicy.AS_IS,
+                self.client, Counter(), self.photo)
+
+    def test_missing_files_are_reported_without_downloading_or_reading(self):
+        self.provide(self.Asset.ORIGINAL, b"full still", "public.heic")
+        self.provide(self.Live.ORIGINAL, b"full movie", "com.apple.quicktime-movie")
+        self.assertFalse(self.probe_one().present)
+        self.assertEqual(self.log.getvalue(), strict_cli.PROTOCOL + "pending\n")
+        self.assertFalse((self.folder / "2020").exists(), "a probe creates nothing")
+
+        self.assertTrue(self.archive_one().present)
+        self.assertTrue(self.probe_one().present)
+        self.assertEqual(self.log.getvalue(), "")
+        next(self.folder.rglob("IMG_1234567.MOV")).unlink()  # a missing Live Photo movie counts too
+        self.assertFalse(self.probe_one().present)
+        self.assertIn("pending", self.log.getvalue())
+
+    def test_size_change_is_reported(self):
+        self.provide(self.Asset.ORIGINAL, b"full still", "public.heic")
+        self.archive_one()
+        next(self.folder.rglob("IMG_1234567.HEIC")).write_bytes(b"short")
+        self.assertFalse(self.probe_one().present)
+
+    def test_existing_preview_does_not_satisfy_a_missing_live_original(self):
+        self.provide(self.Asset.ORIGINAL, b"full still", "public.heic")
+        self.provide(self.Live.MEDIUM, b"small movie", "com.apple.quicktime-movie")
+        self.assertFalse(self.archive_one().present)
+        self.assertFalse(self.probe_one().present)
+        self.assertEqual(self.log.getvalue(), strict_cli.PROTOCOL + "pending\n")
+
+    def test_missing_or_empty_sidecar_triggers_repair(self):
+        self.provide(self.Asset.ORIGINAL, b"full still", "public.heic")
+        self.assertTrue(self.archive_one().present)
+        sidecar, = self.folder.rglob("*.xmp")
+        sidecar.unlink()
+        self.assertFalse(self.probe_one().present)
+        sidecar.touch()
+        self.assertFalse(self.probe_one().present)
+        self.assertTrue(self.archive_one().present)
+        self.assertTrue(self.probe_one().present)
+
+    def test_modes_cannot_be_mixed(self):
+        self.provide(self.Asset.ORIGINAL, b"full still", "public.heic")
+        from icloudpd import base
+        from icloudpd.counter import Counter
+        from pyicloud_ipd.file_match import FileMatchPolicy
+        from pyicloud_ipd.raw_policy import RawTreatmentPolicy
+        args = (logging.getLogger("t"), "{:%Y/%m}", str(self.folder),
+                [self.Asset.ORIGINAL, self.Asset.ALTERNATIVE, self.Asset.ADJUSTED], False)
+        rest = (False, False, self.Live.ORIGINAL, False, FileMatchPolicy.NAME_ID7, True, base.lp_filename_original,
+                lambda _: "IMG_1234567.HEIC", RawTreatmentPolicy.AS_IS, None, Counter(), self.photo)
+        with self.assertRaisesRegex(RuntimeError, "Unexpected"):
+            strict_cli.ProbeArchive()(*args, False, *rest)
+        with self.assertRaisesRegex(RuntimeError, "Unexpected"):
+            strict_cli.StrictArchive()(*args, True, *rest)
+
+    def test_pinned_cli_accepts_the_probe_arguments(self):
+        from worker.engine import MEDIA_OPTIONS, WATCH_RECENT
+        seen = {}
+
+        def capture(global_ns, user_nses):
+            from icloudpd import base
+            seen.update(builder=type(base.download_builder), only=global_ns.only_print_filenames,
+                        recent=user_nses[0].recent, library=user_nses[0].library)
+            return 0
+
+        argv = ["icloudpd", "--no-progress-bar", "--log-level", "info", "--domain", "com",
+                "--password-provider", "console", "--mfa-provider", "console", "--username", "a@example.com",
+                "--cookie-directory", str(self.folder), "--library", "PrimarySync", "--directory", str(self.folder),
+                *MEDIA_OPTIONS, "--recent", str(WATCH_RECENT), "--only-print-filenames"]
+        with patch.object(sys, "argv", argv), patch("icloudpd.cli.run_with_configs", side_effect=capture), \
+                redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(strict_cli.main(), 0)
+        self.assertEqual(seen, dict(builder=strict_cli.ProbeArchive, only=True, recent=WATCH_RECENT,
+                                    library="PrimarySync"))
+        self.assertIn(strict_cli.PROTOCOL + "checked", out.getvalue())

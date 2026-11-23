@@ -60,6 +60,8 @@ if control.get("denied") and "--adp-web-access" not in args:
     log("Photo request failed: ACCESS_DENIED", "ERROR")
     sys.exit(1)
 
+assert "--fn-cleanup-apply" not in args
+
 if "--list-libraries" in args:
     print("PrimarySync")
     for library in control.get("libraries", []):
@@ -75,6 +77,19 @@ if hidden and library != "PrimarySync" and control.get("fail_hidden_shared"):
 if not hidden and library == "PrimarySync" and control.get("fail_primary"):
     log("Photo library request failed", "ERROR")
     sys.exit(1)
+
+if "--only-print-filenames" in args:
+    # Real-time probe: report missing newest assets, never write or create anything.
+    assert "--recent" in args and "--until-found" not in args and not hidden
+    if control.get("probe_fail"):
+        log("Photo library request failed", "ERROR")
+        sys.exit(1)
+    folder = pathlib.Path(arg("--directory")) / "2026" / "01"
+    for index in range(min(control.get("files", 1), int(arg("--recent")))):
+        if not all((folder / f"test-{index}.{ext}").exists() for ext in ("HEIC", "MOV")):
+            print("FNARCHIVE/1 pending", flush=True)
+    print("FNARCHIVE/1 checked", flush=True)
+    sys.exit(0)
 
 folder = pathlib.Path(arg("--directory")) / "2026" / "01"
 folder.mkdir(parents=True, exist_ok=True)

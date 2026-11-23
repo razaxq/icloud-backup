@@ -159,6 +159,64 @@ class RunSyncTests(unittest.TestCase):
         self.assertTrue((self.dest / "2026/01/hidden-0.HEIC").exists())
         self.assertFalse(any("--until-found" in call for call in self.calls()))
 
+    def test_listing_reports_shared_libraries_for_the_probe(self):
+        result, _ = self.run_sync({"libraries": ["SharedSync-ABC"]})
+        self.assertEqual(result.libraries, ["SharedSync-ABC"])
+        result, _ = self.run_sync(include_shared=False)
+        self.assertIsNone(result.libraries)
+
+    def test_completed_phases_are_skipped_and_reported(self):
+        done = []
+        result, events = self.run_sync({"libraries": ["SharedSync-ABC"]},
+                                       full_scan=False, skip_phases=frozenset({"PrimarySync", "PrimarySync/Hidden"}),
+                                       on_phase=done.append)
+        libraries = [call[call.index("--library") + 1] for call in self.calls() if "--library" in call]
+        self.assertEqual(libraries, ["SharedSync-ABC", "SharedSync-ABC"])
+        self.assertFalse((self.dest / "2026").exists())
+        self.assertEqual(done, ["SharedSync-ABC", "SharedSync-ABC/Hidden"])
+        self.assertIn(("info", "个人图库已在上次完成，跳过。"), events)
+        self.assertEqual(result.failures, [])
+
+    def test_failed_phase_is_not_reported_done(self):
+        done = []
+        self.run_sync({"fail_primary": True}, include_shared=False, on_phase=done.append)
+        self.assertEqual(done, ["PrimarySync/Hidden"])
+
+    def test_probe_with_nothing_new_is_silent_and_writes_nothing(self):
+        self.run_sync({"libraries": ["SharedSync-ABC"]})  # baseline archive
+        self.calls_file.unlink()
+        result, events = self.run_sync({"libraries": ["SharedSync-ABC"]}, watch=True,
+                                       known_libraries=["SharedSync-ABC", "../escape", "PrimarySync"])
+        self.assertTrue(result.probe_only)
+        self.assertEqual((result.pending, result.downloaded, result.failures, events), (0, 0, [], []))
+        calls = self.calls()
+        self.assertEqual([call[call.index("--library") + 1] for call in calls], ["PrimarySync", "SharedSync-ABC"])
+        for call in calls:
+            self.assertIn("--only-print-filenames", call)
+            self.assertEqual(call[call.index("--recent") + 1], str(engine.WATCH_RECENT))
+            self.assertNotIn("--album", call)
+
+    def test_probe_finding_new_items_runs_a_quick_check(self):
+        self.run_sync({"files": 1}, include_shared=False)
+        self.calls_file.unlink()
+        result, events = self.run_sync({"files": 2}, watch=True, include_shared=False)
+        self.assertFalse(result.probe_only)
+        self.assertEqual(result.pending, 1)
+        self.assertEqual(events[0], ("begin", "发现 1 个待核对项目，开始快速检查。"))
+        self.assertTrue((self.dest / "2026/01/test-1.MOV").exists())
+        quick = [call for call in self.calls() if "--only-print-filenames" not in call]
+        self.assertTrue(quick and all("--until-found" in call for call in quick))
+        self.assertFalse(result.full_scan)
+
+    def test_probe_skips_libraries_never_archived_and_reports_failures(self):
+        self.run_sync(watch=True, include_shared=True, known_libraries=["SharedSync-NEW"])
+        probes = [call[call.index("--library") + 1] for call in self.calls() if "--only-print-filenames" in call]
+        self.assertEqual(probes, ["PrimarySync"], "a shared library never archived is left to scheduled runs")
+        result, events = self.run_sync({"probe_fail": True}, watch=True)
+        self.assertFalse(result.probe_only)
+        self.assertTrue(result.failures)
+        self.assertFalse(any(kind == "begin" for kind, _ in events))
+
     def test_incremental_scan_uses_until_found(self):
         result, _ = self.run_sync(full_scan=False, include_shared=False)
         self.assertFalse(result.full_scan)
@@ -166,6 +224,30 @@ class RunSyncTests(unittest.TestCase):
         self.assertEqual(len(media), 2)
         for call in media:
             self.assertEqual(call[call.index("--until-found") + 1], str(engine.INCREMENTAL_UNTIL_FOUND))
+
+    def test_preview_scans_full_scope_and_never_applies_changes(self):
+        rule = {"mode": "latest", "value": 5}
+        result, events = self.run_sync({"libraries": ["SharedSync-ABC"]}, cleanup=rule, full_scan=False,
+                                       skip_phases={"PrimarySync"})
+        self.assertFalse(result.failures)
+        calls = self.calls()
+        recorded = [call for call in calls if "--fn-archive-record" in call]
+        self.assertEqual(len(recorded), 4)
+        self.assertFalse(any("--until-found" in call for call in recorded))
+        self.assertFalse(any("--fn-cleanup-apply" in call for call in calls))
+        self.assertFalse(any(kind == "removed" for kind, _ in events))
+        self.assertIn("预览", result.review)
+
+    def test_incomplete_backup_and_quiet_probe_cannot_apply_cleanup(self):
+        rule = {"mode": "immediate"}
+        result, _ = self.run_sync({"missing_live": True}, cleanup=rule)
+        self.assertTrue(result.failures)
+        self.assertFalse(any("--fn-cleanup-apply" in call for call in self.calls()))
+        self.run_sync()
+        self.calls_file.unlink()
+        result, _ = self.run_sync(watch=True, cleanup=rule)
+        self.assertTrue(result.probe_only)
+        self.assertFalse(any("--fn-cleanup-apply" in call for call in self.calls()))
 
     def test_failed_library_does_not_stop_others(self):
         result, events = self.run_sync({"fail_primary": True, "libraries": ["SharedSync-ABC"],
