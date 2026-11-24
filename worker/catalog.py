@@ -150,7 +150,24 @@ def xmp_bytes(record):
     return ElementTree.tostring(generate_xml(build_metadata(record)), encoding="utf-8", xml_declaration=True)
 
 
-def save_manifest(folder, root, photo, item, version, original_name, resources, missing):
+def read_manifest(folder, item, revision):
+    path = folder / "manifest.json"
+    if path.is_symlink():
+        raise ValueError("invalid manifest path")
+    try:
+        data = json.loads(path.read_bytes())
+    except FileNotFoundError:
+        return None
+    if not isinstance(data, dict) or data.get("status") not in ("verified", "incomplete"):
+        raise ValueError("invalid archive manifest")
+    if data.get("identity") != item or data.get("revision") != revision:
+        raise ValueError("manifest ownership conflict")
+    return data
+
+
+def save_manifest(folder, root, photo, item, version, original_name, resources, missing, previous=None):
+    if previous and missing:
+        return previous
     record = photo._asset_record
     # Preserve Apple-supplied editing metadata. Never store sessions, signed URLs or wrapping keys.
     fields = record["fields"]
@@ -161,6 +178,9 @@ def save_manifest(folder, root, photo, item, version, original_name, resources, 
     data = dict(format=1, identity=item, revision=version, originalName=original_name,
                 metadata=metadata, resources=resources, missing=sorted(set(missing)),
                 status="incomplete" if missing else "verified")
+    if previous and data != previous:
+        # Older full-scan reports refer to the digest of the manifest they saw.
+        write_atomic(folder / f".manifest-{token(previous)}.json", encoded(previous))
     write_atomic(folder / "manifest.json", encoded(data))
     for parent in folder.parents:
         if not parent.is_relative_to(root):

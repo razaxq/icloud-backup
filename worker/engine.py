@@ -44,7 +44,8 @@ MEDIA_OPTIONS = (
 INCREMENTAL_UNTIL_FOUND = 100
 
 INTEGRITY_REASONS = {
-    "inventory": "图库清单不一致，已停止 iCloud 清理",
+    "inventory": "图库记录与归档清单不一致",
+    "archived-resource": "同一版本缺少先前记录的原件或配套文件，或其云端描述已发生变化",
     "raw": "缺少 RAW 或替代原件",
     "auxiliary": "附属资源未知或缺少下载信息",
     "conflicting-resource": "同一资源有不同的云端内容，需要核对",
@@ -352,7 +353,11 @@ def run_sync(*, binary, username, domain, destination, session_dir,
     except OSError as exc:
         raise SyncError("无法访问保存目录或私有会话目录，请检查空间和权限。") from exc
 
-    monitor.poll()
+    def check_job():
+        _check_cancel(cancel)
+        monitor.poll()
+
+    check_job()
     base = ["--no-progress-bar", "--log-level", "info", "--domain", domain,
             "--password-provider", "console", "--mfa-provider", "console",
             "--username", username, "--cookie-directory", str(cookies)]
@@ -433,7 +438,7 @@ def run_sync(*, binary, username, domain, destination, session_dir,
                 done.update(skip_phases)
             else:
                 checkpoint.unlink(missing_ok=True)
-                retention.create_inventory(inventory, target, [("PrimarySync", target)])
+                retention.create_inventory(inventory, target, [("PrimarySync", target)], check=check_job)
         download_library("PrimarySync", target, "个人图库", False)
         if include_shared:
             listed = run(["--list-libraries"], "共享图库", listing=True)
@@ -444,21 +449,23 @@ def run_sync(*, binary, username, domain, destination, session_dir,
                     shared_folder = target / "共享图库" / library
                     if audit:
                         with closing(sqlite3.connect(inventory)) as db, db:
-                            retention.index_legacy(db, target, library, shared_folder)
+                            retention.index_legacy(db, target, library, shared_folder, check=check_job)
                     download_library(library, shared_folder, f"共享图库（{_short_library(library)}）", True)
         if audit:
             complete = not outcome.failures and not outcome.warnings
             space.check(target)
             try:
                 verified, incomplete, unassigned, selected = retention.publish_review(
-                    inventory, target, cookies.name, rule, complete, recheck=resumed)
+                    inventory, target, cookies.name, rule, complete, recheck=resumed, check=check_job)
             except (ValueError, KeyError, OSError, retention.IntegrityError) as exc:
                 if isinstance(exc, OSError):
                     space.check(target)
                 raise SyncError("归档核对报告未完成，请检查原件、目录权限和磁盘空间。") from exc
             outcome.review = (f"已生成完整档案 {verified} 份、不完整档案 {incomplete} 份，"
                               f"旧文件归属待确认 {unassigned} 份。")
-            if preview and complete:
+            if incomplete:
+                outcome.note(outcome.failures, f"完整扫描仍有 {incomplete} 个项目未通过原件校验。")
+            if preview and complete and not incomplete:
                 outcome.review += f" 策略预览选中 {selected} 项，云端原件全部保留。"
             on_event("info", outcome.review)
             checkpoint.unlink(missing_ok=True)

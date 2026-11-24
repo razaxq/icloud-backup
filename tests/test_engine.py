@@ -159,6 +159,23 @@ class RunSyncTests(unittest.TestCase):
         self.assertTrue((self.dest / "2026/01/hidden-0.HEIC").exists())
         self.assertFalse(any("--until-found" in call for call in self.calls()))
 
+    def test_incomplete_inventory_prevents_success_after_clean_downloader_exit(self):
+        from contextlib import closing
+        import sqlite3
+        from unittest.mock import patch
+
+        publish = engine.retention.publish_review
+        def publish_with_incomplete(path, *args, **kwargs):
+            with closing(sqlite3.connect(path)) as db, db:
+                db.execute("INSERT INTO assets VALUES(?,?,?,?,?,?)",
+                           ("missing-live", "PrimarySync", None, "missing/manifest.json", "", 0))
+            return publish(path, *args, **kwargs)
+
+        with patch.object(engine.retention, "publish_review", side_effect=publish_with_incomplete):
+            result, _ = self.run_sync(cleanup={"mode": "immediate"}, include_shared=False)
+        self.assertTrue(any("1 个项目未通过原件校验" in reason for reason in result.failures))
+        self.assertNotIn("策略预览选中", result.review)
+
     def test_completed_phases_are_skipped_and_reported(self):
         done = []
         result, events = self.run_sync({"libraries": ["SharedSync-ABC"]},

@@ -527,6 +527,24 @@ class ArchiveConsistencyTests(unittest.TestCase):
             self.assertEqual((app.job["checked"], app.job["verified"]), (2, 1))
             self.assertEqual(len(app.history), 1)
 
+    def test_auto_continue_delays_retry_when_disk_disappears(self):
+        app = self.archive()
+        account = app.find(app.save_account(self.payload))
+        app.job.update(account_id=account["id"], trigger="manual")
+        app._record_pause(account, full=True, low=archive_module.space.LowSpace(0, archive_module.space.RESERVE))
+        with mock.patch.object(app, "destination", return_value=self.dest), \
+                mock.patch.object(archive_module.shutil, "disk_usage", side_effect=OSError("offline")) as usage:
+            with app.lock:
+                app.job["pause_due"] = time.time() - 1
+                app.started -= app.startup_grace
+                app.lock.notify_all()
+                app.lock.wait_for(lambda: app.job["pause_due"] > time.time(), 2)
+                self.assertGreater(app.job["pause_due"], time.time() + 290)
+                self.assertIn("5 分钟后重试", app.job["message"])
+                self.assertEqual(app.job["status"], "paused")
+            usage.assert_called_once()
+        self.assertIsNotNone(account["resume"])
+
     def test_unknown_schema_is_preserved_byte_for_byte(self):
         data = b'{"version":99,"config":{},"accounts":[{"id":"keep"}]}'
         path = self.state_dir / "archive.json"

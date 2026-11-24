@@ -14,7 +14,7 @@ from itertools import chain
 
 from . import catalog
 
-from .strict_cli import IntegrityError, make_directory, matches, present
+from .strict_cli import IntegrityError, hash_file, make_directory, matches, present
 
 
 def policy(mode="off", value=0, shared=False):
@@ -28,7 +28,7 @@ def policy(mode="off", value=0, shared=False):
     return {"mode": mode, "value": value, "shared": shared}
 
 
-def create_inventory(path, root, libraries):
+def create_inventory(path, root, libraries, *, check=None):
     """Index legacy paths once. Paths here are relative to the selected archive root."""
     with closing(sqlite3.connect(path)) as db, db:
         db.executescript("""
@@ -40,7 +40,7 @@ def create_inventory(path, root, libraries):
         """)
         db.execute("INSERT INTO context VALUES (?)", (str(root),))
         for zone, folder in libraries:
-            index_legacy(db, root, zone, folder)
+            index_legacy(db, root, zone, folder, check=check)
 
 
 def resume_inventory(checkpoint, inventory, root, shared, phases):
@@ -76,7 +76,7 @@ def save_checkpoint(inventory, checkpoint, root, shared, phases):
         path.unlink(missing_ok=True)
 
 
-def index_legacy(db, root, zone, folder):
+def index_legacy(db, root, zone, folder, *, check=None):
     if not folder.is_dir():
         return
     if folder.resolve() != folder:
@@ -89,6 +89,8 @@ def index_legacy(db, root, zone, folder):
         if previous.is_symlink():
             raise IntegrityError("local-path")
         for path in chain(paths, previous.glob("*/*")):
+            if check:
+                check()
             if path.resolve() != path:
                 raise IntegrityError("local-path")
             if path.is_file():
@@ -127,16 +129,17 @@ def match_legacy(db, month, name, size, digest):
     return found
 
 
-def record_asset(db, folder, manifest):
+def record_asset(db, folder, manifest, *, complete):
     root = Path(db.execute("SELECT root FROM context").fetchone()[0])
     item = manifest["identity"]
     identity = catalog.encoded(item).decode()
     captured = manifest["metadata"].get("assetDate", {}).get("value")
     values = (identity, item["zone"], captured if type(captured) is int else None,
               str((folder / "manifest.json").relative_to(root)), catalog.token(manifest),
-              int(manifest["status"] == "verified"))
+              int(complete and manifest["status"] == "verified"))
     old = db.execute("SELECT * FROM assets WHERE identity=?", (identity,)).fetchone()
     if old and old != values:
+        db.execute("UPDATE assets SET complete=0 WHERE identity=?", (identity,))
         raise IntegrityError("inventory")
     if not old:
         db.execute("INSERT INTO assets VALUES(?,?,?,?,?,?)", values)
@@ -156,14 +159,23 @@ def candidates(db, rule, now):
     return db.execute("SELECT manifest,digest FROM assets WHERE " + condition, params)
 
 
-def verify_manifest(root, relative, expected, *, on_issue=None, check=None, durable=True):
+def verify_manifest(root, relative, expected, *, on_issue=None, check=None, durable=True, allow_snapshot=False):
     if not isinstance(relative, str) or Path(relative).is_absolute() or ".." in Path(relative).parts or Path(relative).name != "manifest.json":
         raise IntegrityError("local-path")
     path = root / relative
     if not path.is_relative_to(root) or path.resolve(strict=True) != path or not path.is_file():
         raise IntegrityError("local-path")
     manifest = json.loads(path.read_bytes())
-    if (catalog.token(manifest) != expected or manifest["status"] != "verified" or manifest["missing"]
+    if catalog.token(manifest) != expected:
+        if not allow_snapshot or not isinstance(expected, str) or not re.fullmatch("[0-9a-f]{64}", expected):
+            raise IntegrityError("inventory")
+        snapshot = path.with_name(f".manifest-{expected}.json")
+        if snapshot.is_symlink() or not snapshot.is_file():
+            raise IntegrityError("inventory")
+        manifest = json.loads(snapshot.read_bytes())
+        if catalog.token(manifest) != expected:
+            raise IntegrityError("inventory")
+    if (manifest["status"] != "verified" or manifest["missing"]
             or not manifest["resources"]):
         raise IntegrityError("inventory")
     if catalog.layout(path.parent.parent.parent, manifest["identity"], manifest["revision"]) != path.parent:
@@ -198,8 +210,8 @@ def verify_manifest(root, relative, expected, *, on_issue=None, check=None, dura
         if "xmpSHA256" in resource:
             sidecar = media.with_name(name + ".xmp")
             def valid_sidecar():
-                with sidecar.open("rb") as stream:
-                    return hashlib.file_digest(stream, "sha256").hexdigest() == resource["xmpSHA256"]
+                digest = hashlib.sha256()
+                return hash_file(sidecar, (digest,), check=check) and digest.hexdigest() == resource["xmpSHA256"]
             inspect(sidecar, valid_sidecar)
     return manifest
 
@@ -214,17 +226,25 @@ def issue_reason(exc):
     return "清单、项目身份或路径校验失败"
 
 
-def report_header(path):
+def _open_report(path):
     if path.resolve(strict=True) != path or not stat.S_ISREG(path.lstat().st_mode):
         raise IntegrityError("local-path")
-    with path.open(encoding="utf-8") as stream:
-        header = json.loads(stream.readline(65536))
+    return path.open(encoding="utf-8")
+
+
+def _read_header(stream):
+    header = json.loads(stream.readline(65536))
     if (not isinstance(header, dict) or header.get("kind") != "scan" or header.get("complete") is not True
             or header.get("incomplete") != 0 or type(header.get("verified")) is not int
             or header["verified"] < 0 or type(header.get("time")) not in (int, float)
             or not 0 <= header["time"] < 253402300800):
         raise IntegrityError("inventory")
     return header
+
+
+def report_header(path):
+    with _open_report(path) as stream:
+        return _read_header(stream)
 
 
 def report_choices(root, account_key):
@@ -264,7 +284,7 @@ def keep_snapshot(latest):
     catalog.fsync_dir(latest.parent)
 
 
-def publish_review(path, root, account_key, rule, scan_complete, *, recheck=False):
+def publish_review(path, root, account_key, rule, scan_complete, *, recheck=False, check=None):
     """Replace the previous report only after writing the whole new, dated snapshot."""
     folder = root / ".icloud-archive"
     make_directory(folder)
@@ -279,18 +299,20 @@ def publish_review(path, root, account_key, rule, scan_complete, *, recheck=Fals
         keep_snapshot(latest)  # Preserve a complete report from before the upgrade, too.
         with catalog.publish_file(latest) as report:
             def emit(row):
+                if check:
+                    check()
                 report.write(catalog.encoded(row) + b"\n")
             emit(dict(kind="scan", time=now, complete=bool(ready), verified=verified,
                       incomplete=incomplete, unassigned=unassigned, previewPolicy=rule))
             for relative, digest, ok in db.execute("SELECT manifest,digest,complete FROM assets ORDER BY manifest"):
                 if ok and recheck:
-                    verify_manifest(root, relative, digest)
+                    verify_manifest(root, relative, digest, check=check)
                 emit(dict(kind="asset", manifest=relative, manifestSHA256=digest, verified=bool(ok)))
             for relative, matched in db.execute("SELECT path,matched FROM legacy ORDER BY path"):
                 emit(dict(kind="legacy", path=relative, status="matched-bytes" if matched else "unassigned"))
             if ready:
                 for relative, digest in candidates(db, rule, now):
-                    verify_manifest(root, relative, digest)
+                    verify_manifest(root, relative, digest, check=check)
                     emit(dict(kind="candidate", manifest=relative))
                     count += 1
             emit(dict(kind="summary", candidates=count))
@@ -304,12 +326,10 @@ def verify_report(root, report, *, on_item=None, on_issue=None, check=None, expe
     """Stream the report. CLI fails fast; the web view collects problems per file."""
     root = root.resolve(strict=True)
     report = report.absolute()
-    header = report_header(report)
-    if expected_scan and (header["time"], header["verified"]) != expected_scan:
-        raise IntegrityError("inventory")
     seen = set()
-    with report.open(encoding="utf-8") as stream:
-        if json.loads(stream.readline()) != header:
+    with _open_report(report) as stream:
+        header = _read_header(stream)
+        if expected_scan and (header["time"], header["verified"]) != expected_scan:
             raise IntegrityError("inventory")
         finished = False
         for line in stream:
@@ -321,11 +341,13 @@ def verify_report(root, report, *, on_item=None, on_issue=None, check=None, expe
             if row["kind"] == "asset":
                 relative = row["manifest"]
                 if (row.get("verified") is not True or not isinstance(relative, str) or relative in seen
-                        or Path(relative).is_absolute() or ".." in Path(relative).parts):
+                        or Path(relative).is_absolute() or ".." in Path(relative).parts
+                        or relative != Path(relative).as_posix()):
                     raise IntegrityError("inventory")
                 seen.add(relative)
                 try:
-                    verify_manifest(root, relative, row["manifestSHA256"], on_issue=on_issue, check=check, durable=False)
+                    verify_manifest(root, relative, row["manifestSHA256"], on_issue=on_issue, check=check,
+                                    durable=False, allow_snapshot=True)
                 except (IntegrityError, OSError, ValueError, KeyError, TypeError) as exc:
                     if not on_issue:
                         raise

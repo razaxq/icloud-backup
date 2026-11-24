@@ -54,6 +54,7 @@ def number(value):
 
 STATE_VERSION = 3
 VERIFICATION_VERSION = 2
+LOW_SPACE_MESSAGE = "目标盘空间不足，备份已暂停。每分钟检查一次，空间足够后自动继续。"
 ACTIVE = {"running", "waiting_password", "waiting_code", "cancelling", "pausing"}
 PAUSABLE = {"running", "waiting_password", "waiting_code"}
 HELD = ACTIVE | {"paused"}  # the job owns the single download slot
@@ -765,19 +766,26 @@ class Archive:
             if scheduled_account is not None and (account is not scheduled_account or not self._still_due(account, trigger)):
                 raise RequestError("自动下载计划已变更。", 409)
             roots = self.roots
+            pending_resume = account["resume"]
         destination = self.destination(account["destination"])
-        free = shutil.disk_usage(destination).free
+        try:
+            free = shutil.disk_usage(destination).free
+        except OSError as exc:
+            raise RequestError("无法读取目标盘的剩余空间，请检查磁盘连接。", 503) from exc
         with self.lock:
             if (self.shutdown or self.job["status"] in ACTIVE or self.verification.get("status") == "running"
                     or (self.job["status"] == "paused") != (trigger == "continue")):
                 raise RequestError("当前已有任务正在运行或停止。", 409)
             # save_account replaces the dictionary on every committed edit.
             # Do not combine the old validated path with a new account/schedule.
-            if (self.find(account_id) is not account or roots is not self.roots or
-                    (scheduled_account is not None and not self._still_due(account, trigger))):
+            if (self.find(account_id) is not account or roots is not self.roots
+                    or account["resume"] is not pending_resume
+                    or (scheduled_account is not None and not self._still_due(account, trigger))):
                 raise RequestError("账户设置、自动下载计划或目录授权已更改，请重新开始。", 409)
             if trigger == "continue" and self.job.get("space_required") and free <= self.job["space_required"]:
-                self.job.update(free_bytes=free, pause_due=time.time() + 60)
+                next_check = time.time() + 60
+                self.set_job("paused", LOW_SPACE_MESSAGE, free_bytes=free,
+                             pause_due=next_check, pause_until=timestamp(next_check))
                 if scheduled_account is None:
                     raise RequestError("空间仍不足，请释放空间后继续。", 409)
                 return
@@ -1066,7 +1074,7 @@ class Archive:
         if low:
             self.job.update(space_required=low.required, free_bytes=low.free)
             until = time.time() + 60
-            message = "目标盘空间不足，备份已暂停。每分钟检查一次，空间足够后自动继续。"
+            message = LOW_SPACE_MESSAGE
         self.set_job("paused", message, pause_until=timestamp(until) if until else None, pause_due=until)
         self.log("info", message)
 
@@ -1092,10 +1100,10 @@ class Archive:
             self.notify("error", notifier.APP_TITLE + "：定时任务未能开始",
                         f"{notifier.mask_account(label)}：定时任务未能开始。请在飞牛应用中查看任务详情。")
 
-    def _delay_continue(self, reason):
+    def _delay_continue(self, account, reason):
         """A timed pause could not continue (e.g. the disk is offline): stay paused and retry later."""
         with self.lock:
-            if self.job["status"] != "paused":
+            if self.find(account["id"]) is not account or not self._still_due(account, "continue"):
                 return
             due = time.time() + 300
             self.set_job("paused", f"未能自动继续：{reason} 5 分钟后重试。", pause_until=timestamp(due), pause_due=due)
@@ -1139,7 +1147,7 @@ class Archive:
                 self.start(account_id, trigger, scheduled_account=account)
             except RequestError as exc:
                 if trigger == "continue" and exc.status != 409:
-                    self._delay_continue(str(exc))
+                    self._delay_continue(account, str(exc))
                 elif exc.status != 409:
                     self._record_start_failure(account, trigger, str(exc))
                 else:
@@ -1147,7 +1155,11 @@ class Archive:
                         self.lock.wait(timeout=5)
             except Exception:
                 traceback.print_exc()
-                self._record_start_failure(account, trigger, "定时任务无法启动，请检查应用状态目录和 server.log。")
+                message = "定时任务无法启动，请检查应用状态目录和 server.log。"
+                if trigger == "continue":
+                    self._delay_continue(account, message)
+                else:
+                    self._record_start_failure(account, trigger, message)
 
     def close(self):
         with self.lock:

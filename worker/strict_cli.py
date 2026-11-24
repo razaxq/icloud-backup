@@ -35,7 +35,8 @@ def signature(version):
     return value
 
 
-def matches(path, size, expected, *, durable=False, content_hash=None, check=None):
+def hash_file(path, hashes, *, size=None, durable=False, check=None):
+    """Hash a regular file in one pass and confirm the same file stayed in place."""
     try:
         mode = path.lstat().st_mode
     except FileNotFoundError:
@@ -44,21 +45,26 @@ def matches(path, size, expected, *, durable=False, content_hash=None, check=Non
         raise IntegrityError("local-path")
     with path.open("rb") as stream:
         before = os.fstat(stream.fileno())
-        if before.st_size != size:
+        if size is not None and before.st_size != size:
             return False
-        digest = hashlib.sha1(SALT, usedforsecurity=False)
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             if check:
                 check()
-            digest.update(chunk)
-            if content_hash is not None:
-                content_hash.update(chunk)
+            for digest in hashes:
+                digest.update(chunk)
         if durable:
             os.fsync(stream.fileno())
         after = os.fstat(stream.fileno())
         same_file = os.path.samestat(after, path.lstat())
-    return (same_file and before.st_ctime_ns == after.st_ctime_ns and before.st_mtime_ns == after.st_mtime_ns
-            and digest.digest() == expected[1:])
+    return same_file and before.st_ctime_ns == after.st_ctime_ns and before.st_mtime_ns == after.st_mtime_ns
+
+
+def matches(path, size, expected, *, durable=False, content_hash=None, check=None):
+    if len(expected) != 21 or expected[0] != 1 or type(size) is not int or size <= 0:
+        raise IntegrityError("signature")
+    digest = hashlib.sha1(SALT, usedforsecurity=False)
+    hashes = (digest,) if content_hash is None else (digest, content_hash)
+    return hash_file(path, hashes, size=size, durable=durable, check=check) and digest.digest() == expected[1:]
 
 
 def make_directory(path):
@@ -67,10 +73,10 @@ def make_directory(path):
         raise IntegrityError("local-path")
 
 
-def publish_verified(path, version, fetch):
-    """Return True for a new verified write. Keep interrupted transfers resumable."""
+def publish_verified(path, version, fetch, *, existing_hash=None):
+    """Return True for a new write. On a verified cache hit, existing_hash contains the final digest."""
     expected = signature(version)
-    if matches(path, version.size, expected):
+    if matches(path, version.size, expected, durable=existing_hash is not None, content_hash=existing_hash):
         return False
     working = path.parent / ".icloud-work"
     make_directory(working)
@@ -111,7 +117,7 @@ def publish_verified(path, version, fetch):
             try:
                 space.check(previous, path.stat().st_size)
                 shutil.copy2(path, backup)
-            except OSError:
+            except (OSError, space.LowSpace):
                 backup.unlink(missing_ok=True)
                 backup.parent.rmdir()
                 raise
@@ -169,6 +175,7 @@ def renditions(photo, name, primary_sizes, lp_filename_generator):
     required = [(Asset.ORIGINAL, (Asset.MEDIUM, Asset.THUMB), "original")]
     if live:
         required.append((Live.ORIGINAL, (Live.MEDIUM, Live.THUMB), "live"))
+    expected = {resource_role(size) for size, _, _ in required}
     for original, fallbacks, reason in required:
         if original in versions:
             if original not in selected:
@@ -199,16 +206,19 @@ def renditions(photo, name, primary_sizes, lp_filename_generator):
              "resJPEGMed", "resJPEGThumb", "resVidMed", "resVidSmall", "resJPEGLarge"}
     for prefix, size, reason in (("resOriginalAlt", Asset.ALTERNATIVE, "raw"),
                                  ("resJPEGFull", Asset.ADJUSTED, "adjusted")):
-        if size not in versions and any(k.startswith(prefix) and v.get("value")
-                                        for rec in records for k, v in rec.items()):
+        hinted = any(k.startswith(prefix) and v.get("value") for rec in records for k, v in rec.items())
+        if size in versions or hinted:
+            expected.add(resource_role(size))
+        if hinted and size not in versions:
             missing.append(reason)
     suffixes = ("Res", "FileType", "Fingerprint", "Width", "Height")
     def add_extra(rec, prefix, source):
+        role = source + "-" + prefix
+        expected.add(role)
         version = described_resource(rec, prefix)
         if version is None:
             missing.append("auxiliary")
             return
-        role = source + "-" + prefix
         ext = ITEM_TYPE_EXTENSIONS.get(version.type, "bin")
         files.append((role, version, f"{role}.{ext}", False))
 
@@ -219,6 +229,7 @@ def renditions(photo, name, primary_sizes, lp_filename_generator):
             if prefix in ("resSidecar", "resVidFull"):
                 add_extra(rec, prefix, source)
             else:
+                expected.add(source + "-" + prefix)
                 missing.append("auxiliary")
     for prefix in ("resOriginal", "resOriginalAlt", "resOriginalVidCompl", "resJPEGFull"):
         values = [rec.get(prefix + "Res", {}).get("value") for rec in records]
@@ -232,10 +243,11 @@ def renditions(photo, name, primary_sizes, lp_filename_generator):
                    or not (Asset.ADJUSTED in versions or any("resVidFullRes" in rec for rec in records))):
         missing.append("edit")
     names = [filename.casefold() for _, _, filename, _ in files]
-    if len(names) != len(set(names)) or any(n in (".identity.json", "manifest.json", ".icloud-work", ".icloud-previous")
-                                            or n + ".xmp" in names for n in names):
+    if len(names) != len(set(names)) or any(n in (".identity.json", "manifest.json", ".required-roles.json",
+                                                        ".icloud-work", ".icloud-previous")
+                                            or n.startswith(".manifest-") or n + ".xmp" in names for n in names):
         raise IntegrityError("local-path")
-    return files, list(dict.fromkeys(missing))
+    return files, list(dict.fromkeys(missing)), expected
 
 
 def check_options(folder_structure, primary_sizes, force_size, set_exif_datetime, skip_live_photos,
@@ -257,6 +269,53 @@ def present(path, size=None):
     return stat.S_ISREG(info.st_mode) and info.st_size > 0 and (size is None or info.st_size == size)
 
 
+def resource_role(size):
+    return size if type(size) is str else type(size).__name__ + "." + size.name
+
+
+def remember_requirements(folder, manifest, expected):
+    """Remember disclosed originals before an interruption or a later sparse cloud response."""
+    from pyicloud_ipd.version_size import AssetVersionSize as Asset, LivePhotoVersionSize as Live
+
+    path = folder / ".required-roles.json"
+    if path.is_symlink():
+        raise IntegrityError("local-path")
+    try:
+        roles = json.loads(path.read_bytes())
+    except FileNotFoundError:
+        roles = []
+    if not isinstance(roles, list) or not all(isinstance(role, str) for role in roles):
+        raise IntegrityError("inventory")
+    recorded = set(roles) | {resource_role(Asset.ORIGINAL)}
+    known = recorded.copy()
+    if manifest:
+        previews = {resource_role(s) for s in (Asset.MEDIUM, Asset.THUMB, Live.MEDIUM, Live.THUMB)}
+        archived = {r["role"] for r in manifest["resources"]} - previews
+        known.update(archived)
+        if manifest["status"] == "verified":
+            recorded.update(archived)  # Verified manifests are preserved on a failed retry.
+        else:
+            # Partial manifests from older releases can already prove these roles are required.
+            if str(manifest["metadata"].get("assetSubtypeV2", {}).get("value")) == "2":
+                known.add(resource_role(Live.ORIGINAL))
+            originals = {"live": Live.ORIGINAL, "raw": Asset.ALTERNATIVE, "adjusted": Asset.ADJUSTED}
+            known.update(resource_role(originals[reason]) for reason in manifest["missing"] if reason in originals)
+    required = known | expected
+    if required - recorded:
+        catalog.write_atomic(path, catalog.encoded(sorted(required)))
+    return known - expected
+
+
+def preserves_resources(previous, files, metadata):
+    """A repeat observation of the same revision must cover each known original and sidecar."""
+    sidecar_hash = hashlib.sha256(metadata).hexdigest() if metadata is not None else None
+    described = {(resource_role(size), name): (version.size, signature(version).hex(), version.type,
+                                                sidecar_hash if sidecar else None)
+                 for size, version, name, sidecar in files}
+    return all(described.get((r["role"], r["name"])) ==
+               (r["bytes"], r["appleChecksum"], r["type"], r.get("xmpSHA256")) for r in previous["resources"])
+
+
 class StrictArchive:
     """The pinned CLI supplies its resolved naming policy, session, counter and asset."""
 
@@ -272,12 +331,55 @@ class StrictArchive:
         printable = "".join(c if c.isprintable() else "_" for c in name[:255])
         print(PROTOCOL + json.dumps([reason, printable], ensure_ascii=True), flush=True)
 
+    def _archive_resource(self, folder, month, size, version, filename, metadata,
+                          icloud, photo, logger, filename_builder):
+        from . import retention
+        from icloudpd import download
+
+        path = folder / filename
+        expected = signature(version)
+        # A full scan must attribute matching legacy files even when the new file exists.
+        legacy = None
+        if self.inventory is not None:
+            legacy = retention.match_legacy(self.inventory, month, filename, version.size, expected)
+
+        def fetch(stage):
+            source = legacy
+            if self.inventory is None:
+                source = retention.match_legacy(None, month, filename, version.size, expected)
+            if source is not None:
+                space.check(Path(stage).parent, version.size)
+                shutil.copyfile(source, stage)
+                return True
+            transfer_size = size
+            if isinstance(size, str):
+                from pyicloud_ipd.version_size import AssetVersionSize
+                transfer_size = AssetVersionSize.ORIGINAL
+            return download.download_media(logger, False, icloud, photo, stage,
+                                           version, transfer_size, filename_builder)
+
+        content_hash = hashlib.sha256()
+        written = publish_verified(path, version, fetch, existing_hash=content_hash)
+        if written:
+            download.update_mtime(photo.created, str(path))
+            content_hash = hashlib.sha256()
+            if not matches(path, version.size, expected, durable=True, content_hash=content_hash):
+                raise IntegrityError("mismatch")
+            logger.info("Downloaded verified media")
+        entry = dict(role=resource_role(size), name=filename, bytes=version.size, appleChecksum=expected.hex(),
+                     type=version.type, sha256=content_hash.hexdigest())
+        if metadata is not None:
+            catalog.write_atomic(path.with_name(filename + ".xmp"), metadata)
+            retention.match_legacy_xmp(self.inventory, month, filename + ".xmp", metadata)
+            entry["xmpSHA256"] = hashlib.sha256(metadata).hexdigest()
+        return written, entry
+
     def __call__(self, logger, folder_structure, directory, primary_sizes, force_size,
                  only_print_filenames, set_exif_datetime, skip_live_photos, live_photo_size,
                  dry_run, file_match_policy, xmp_sidecar, lp_filename_generator,
                  filename_builder, raw_policy, icloud, counter, photo):
         from . import retention
-        from icloudpd import base, download
+        from icloudpd import base
         from tzlocal import get_localzone
 
         check_options(folder_structure, primary_sizes, force_size, set_exif_datetime, skip_live_photos,
@@ -301,13 +403,23 @@ class StrictArchive:
             for component in Path(folder_structure.format(created)).parts:
                 folder = folder / component
                 make_directory(folder)
-            files, missing = renditions(photo, name, primary_sizes, lp_filename_generator)
+            files, missing, expected = renditions(photo, name, primary_sizes, lp_filename_generator)
             rev = catalog.revision(photo)
             month, root = folder, Path(directory)
             folder = catalog.layout(month, item, rev)
             make_directory(folder.parent)
             make_directory(folder)
             locks.enter_context(catalog.claim(folder, item, rev))
+            previous = catalog.read_manifest(folder, item, rev)
+            missing_roles = remember_requirements(folder, previous, expected)
+            verified = previous if previous and previous["status"] == "verified" else None
+            metadata = (catalog.xmp_bytes(photo._asset_record)
+                        if xmp_sidecar and any(sidecar for _, _, _, sidecar in files) else None)
+            conflict = verified is not None and not preserves_resources(verified, files, metadata)
+            if missing_roles or conflict:
+                missing.append("archived-resource")
+            if conflict:
+                files = []  # Keep the established revision intact until the cloud records agree.
             resources = []
             for reason in missing:
                 self.issue(reason, name)
@@ -316,37 +428,11 @@ class StrictArchive:
             for size, version, filename, needs_sidecar in files:
                 path = folder / filename
                 try:
-                    # Read old archives without modifying them. A matching hash proves the bytes
-                    # can be copied. The authenticated cloud record supplies ownership and metadata.
-                    expected = signature(version)
-                    legacy = retention.match_legacy(self.inventory, month, filename, version.size, expected)
-                    def fetch(stage):
-                        if legacy is not None:
-                            space.check(Path(stage).parent, version.size)
-                            shutil.copyfile(legacy, stage)
-                            return True
-                        transfer_size = size
-                        if isinstance(size, str):
-                            from pyicloud_ipd.version_size import AssetVersionSize
-                            transfer_size = AssetVersionSize.ORIGINAL
-                        return download.download_media(logger, False, icloud, photo, stage,
-                                                       version, transfer_size, filename_builder)
-                    if publish_verified(path, version, fetch):
+                    new_file, entry = self._archive_resource(
+                        folder, month, size, version, filename, metadata if needs_sidecar else None,
+                        icloud, photo, logger, filename_builder)
+                    if new_file:
                         written.append(str(path))
-                        download.update_mtime(photo.created, str(path))
-                        logger.info("Downloaded verified media")
-                    content_hash = hashlib.sha256()
-                    if not matches(path, version.size, expected, durable=True, content_hash=content_hash):
-                        raise IntegrityError("mismatch")
-                    role = size if type(size) is str else type(size).__name__ + "." + size.name
-                    entry = dict(role=role, name=filename, bytes=version.size, appleChecksum=expected.hex(),
-                                 type=version.type, sha256=content_hash.hexdigest())
-                    if xmp_sidecar and needs_sidecar:
-                        sidecar = Path(str(path) + ".xmp")
-                        data = catalog.xmp_bytes(photo._asset_record)
-                        catalog.write_atomic(sidecar, data)
-                        retention.match_legacy_xmp(self.inventory, month, filename + ".xmp", data)
-                        entry["xmpSHA256"] = hashlib.sha256(data).hexdigest()
                     resources.append(entry)
                 except (IntegrityError, OSError) as exc:
                     if isinstance(exc, OSError) and exc.errno == errno.ENOSPC:
@@ -356,9 +442,9 @@ class StrictArchive:
                     missing.append(reason)
                     complete = False
             original_name = photo.calculate_filename() or name
-            manifest = catalog.save_manifest(folder, root, photo, item, rev, original_name, resources, missing)
+            manifest = catalog.save_manifest(folder, root, photo, item, rev, original_name, resources, missing, verified)
             if self.inventory is not None:
-                retention.record_asset(self.inventory, folder, manifest)
+                retention.record_asset(self.inventory, folder, manifest, complete=complete)
             if complete and not written:
                 counter.increment()
             else:

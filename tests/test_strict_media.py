@@ -147,6 +147,14 @@ class AssetIntegrityTests(unittest.TestCase):
         self.assertFalse(self.archive_one().downloaded)
         self.assertFalse(self.archive.failed)
 
+    def test_existing_media_is_hashed_once_per_scan(self):
+        self.provide(self.Asset.ORIGINAL, b"still", "public.heic")
+        self.assertTrue(self.archive_one().present)
+        media, = self.folder.rglob("*.HEIC")
+        with patch.object(strict_cli, "matches", wraps=strict_cli.matches) as reads:
+            self.assertFalse(self.archive_one().downloaded)
+        self.assertEqual(sum(call.args[0] == media for call in reads.call_args_list), 1)
+
     def test_only_lower_quality_movie_fails_and_preview_has_distinct_name(self):
         self.provide(self.Asset.ORIGINAL, b"full still", "public.heic")
         self.provide(self.Live.MEDIUM, b"smaller movie", "com.apple.quicktime-movie")

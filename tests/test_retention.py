@@ -140,6 +140,95 @@ class ReviewTests(unittest.TestCase):
         retention.publish_review(db_path, self.folder, "account", retention.policy(), False)
         self.assertEqual(retention.report_choices(self.folder, "account"), options)
 
+    def test_incomplete_rescan_keeps_verified_live_photo_and_report(self):
+        db_path = self.inventory()
+        self.provide(self.Asset.ORIGINAL, b"still", "public.heic")
+        self.provide(self.Live.ORIGINAL, b"movie", "com.apple.quicktime-movie")
+        self.assertTrue(self.archive_one().present)
+        self.db.commit()
+        retention.publish_review(db_path, self.folder, "account", retention.policy(), True)
+        report = self.folder / ".icloud-archive/account.jsonl"
+        manifest, = self.folder.rglob("manifest.json")
+        original = manifest.read_bytes()
+        self.archive = strict_cli.StrictArchive()
+        del self.photo.versions[self.Live.ORIGINAL]
+        for fields in ({}, {"assetSubtypeV2": {"value": 2}}):
+            with self.subTest(fields=fields):
+                self.photo._asset_record["fields"] = fields
+                self.assertFalse(self.archive_one().present)
+                self.assertEqual(manifest.read_bytes(), original)
+                self.assertEqual(retention.verify_report(self.folder, report), 1)
+
+    def test_retry_keeps_missing_companions_until_originals_arrive(self):
+        self.provide(self.Asset.ORIGINAL, b"still", "public.heic")
+        fields = self.photo._asset_record["fields"]
+        fields.update(assetSubtypeV2={"value": 2}, resOriginalAltFileType={"value": "com.adobe.raw-image"})
+        self.assertFalse(self.archive_one().present)
+        fields.clear()
+        self.assertFalse(self.archive_one().present)
+        self.provide(self.Live.ORIGINAL, b"movie", "com.apple.quicktime-movie")
+        self.assertFalse(self.archive_one().present)
+        self.provide(self.Asset.ALTERNATIVE, b"raw", "com.adobe.raw-image")
+        self.assertTrue(self.archive_one().present)
+
+    def test_newly_disclosed_companion_remains_required_after_failed_download(self):
+        self.provide(self.Asset.ORIGINAL, b"still", "public.heic")
+        self.assertTrue(self.archive_one().present)
+        self.provide(self.Asset.ALTERNATIVE, b"raw", "com.adobe.raw-image")
+        self.payloads[self.Asset.ALTERNATIVE] = b"bad"
+        self.assertFalse(self.archive_one().present)
+        del self.photo.versions[self.Asset.ALTERNATIVE]
+        self.assertFalse(self.archive_one().present)
+        self.provide(self.Asset.ALTERNATIVE, b"raw", "com.adobe.raw-image")
+        self.assertTrue(self.archive_one().present)
+
+    def test_interrupted_first_scan_remembers_disclosed_live_video(self):
+        self.provide(self.Asset.ORIGINAL, b"still", "public.heic")
+        self.provide(self.Live.ORIGINAL, b"movie", "com.apple.quicktime-movie")
+        with patch.object(strict_cli.space, "check", side_effect=strict_cli.space.LowSpace(0, 100)):
+            with self.assertRaises(SystemExit):
+                self.archive_one()
+        del self.photo.versions[self.Live.ORIGINAL]
+        self.assertFalse(self.archive_one().present)
+        self.provide(self.Live.ORIGINAL, b"movie", "com.apple.quicktime-movie")
+        self.assertTrue(self.archive_one().present)
+
+    def test_cancel_during_report_recheck_preserves_last_complete_report(self):
+        from worker.engine import SyncCancelled
+        db_path = self.inventory()
+        self.provide(self.Asset.ORIGINAL, b"still", "public.heic")
+        self.assertTrue(self.archive_one().present)
+        self.db.commit()
+        retention.publish_review(db_path, self.folder, "account", retention.policy(), True)
+        folder = self.folder / ".icloud-archive"
+        original = {p.name: p.read_bytes() for p in folder.iterdir()}
+        with patch.object(retention, "matches", wraps=retention.matches) as read:
+            def check():
+                if read.called:
+                    raise SyncCancelled("cancelled")
+            with self.assertRaises(SyncCancelled):
+                retention.publish_review(db_path, self.folder, "account", retention.policy(), True,
+                                         recheck=True, check=check)
+        self.assertEqual({p.name: p.read_bytes() for p in folder.iterdir()}, original)
+
+    def test_old_report_after_new_companion_still_checks_old_media(self):
+        db_path = self.inventory()
+        self.provide(self.Asset.ORIGINAL, b"still", "public.heic")
+        self.assertTrue(self.archive_one().present)
+        self.db.commit()
+        retention.publish_review(db_path, self.folder, "account", retention.policy(), True)
+        report = self.folder / ".icloud-archive/account.jsonl"
+        self.archive = strict_cli.StrictArchive()
+        self.provide(self.Asset.ALTERNATIVE, b"raw", "com.adobe.raw-image")
+        self.assertTrue(self.archive_one().present)
+        self.assertEqual(retention.verify_report(self.folder, report), 1)
+        # Active scans and policy previews must still match their current inventory.
+        with self.assertRaises(strict_cli.IntegrityError):
+            retention.publish_review(db_path, self.folder, "account", retention.policy("immediate"), True)
+        next(self.folder.rglob("*.HEIC")).write_bytes(b"bad")
+        with self.assertRaises(strict_cli.IntegrityError):
+            retention.verify_report(self.folder, report)
+
     def test_shared_zone_owner_and_partial_scans(self):
         from worker import catalog
         self.inventory()
