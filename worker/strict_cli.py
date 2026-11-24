@@ -1,10 +1,11 @@
 """Per-asset archiving for the bundled icloudpd 1.33.0 CLI."""
 
-from . import catalog
+from . import catalog, space
 
 from contextlib import ExitStack
 import base64
 import binascii
+import errno
 import hashlib
 import json
 import os
@@ -34,7 +35,7 @@ def signature(version):
     return value
 
 
-def matches(path, size, expected, *, durable=False, content_hash=None):
+def matches(path, size, expected, *, durable=False, content_hash=None, check=None):
     try:
         mode = path.lstat().st_mode
     except FileNotFoundError:
@@ -47,6 +48,8 @@ def matches(path, size, expected, *, durable=False, content_hash=None):
             return False
         digest = hashlib.sha1(SALT, usedforsecurity=False)
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            if check:
+                check()
             digest.update(chunk)
             if content_hash is not None:
                 content_hash.update(chunk)
@@ -85,8 +88,12 @@ def publish_verified(path, version, fetch):
                 os.replace(partial_file, stage)
             else:
                 partial_file.unlink()
-        if not stage.exists() and not fetch(str(stage)):
-            raise IntegrityError("download")
+        if not stage.exists():
+            partial_size = partial_file.stat().st_size if partial_file.is_file() else 0
+            space.check(working, max(0, version.size - partial_size))
+            if not fetch(str(stage)):
+                space.check(working)
+                raise IntegrityError("download")
         if not matches(stage, version.size, expected):
             stage.unlink(missing_ok=True)
             raise IntegrityError("mismatch")
@@ -102,6 +109,7 @@ def publish_verified(path, version, fetch):
             os.link(path, backup)
         except OSError:
             try:
+                space.check(previous, path.stat().st_size)
                 shutil.copy2(path, backup)
             except OSError:
                 backup.unlink(missing_ok=True)
@@ -277,8 +285,11 @@ class StrictArchive:
         if only_print_filenames:
             raise RuntimeError("Unexpected archive options")
         name = ""
+        item_key = None
         locks = ExitStack()
         try:
+            item = catalog.identity(icloud, self.zone, photo)
+            item_key = catalog.token([self.zone, item["asset"]])
             name = filename_builder(photo)
             folder = Path(directory)
             # Shared library folders are validated by the worker. Reject a link
@@ -291,7 +302,6 @@ class StrictArchive:
                 folder = folder / component
                 make_directory(folder)
             files, missing = renditions(photo, name, primary_sizes, lp_filename_generator)
-            item = catalog.identity(icloud, self.zone, photo)
             rev = catalog.revision(photo)
             month, root = folder, Path(directory)
             folder = catalog.layout(month, item, rev)
@@ -312,6 +322,7 @@ class StrictArchive:
                     legacy = retention.match_legacy(self.inventory, month, filename, version.size, expected)
                     def fetch(stage):
                         if legacy is not None:
+                            space.check(Path(stage).parent, version.size)
                             shutil.copyfile(legacy, stage)
                             return True
                         transfer_size = size
@@ -338,6 +349,8 @@ class StrictArchive:
                         entry["xmpSHA256"] = hashlib.sha256(data).hexdigest()
                     resources.append(entry)
                 except (IntegrityError, OSError) as exc:
+                    if isinstance(exc, OSError) and exc.errno == errno.ENOSPC:
+                        raise space.LowSpace(shutil.disk_usage(folder).free, space.RESERVE) from exc
                     reason = str(exc) if isinstance(exc, IntegrityError) else "io"
                     self.issue(reason, filename)
                     missing.append(reason)
@@ -350,8 +363,19 @@ class StrictArchive:
                 counter.increment()
             else:
                 counter.reset()
+            print(PROTOCOL + f"item {int(complete)} {item_key}", flush=True)
             return base.DownloadResult(downloaded=bool(written), present=complete, created_paths=tuple(written))
+        except space.LowSpace as exc:
+            print(PROTOCOL + f"space {exc.free} {exc.required}", flush=True)
+            raise SystemExit(73) from exc
         except (IntegrityError, KeyError, IndexError, OSError, TypeError, ValueError, OverflowError) as exc:
+            if isinstance(exc, OSError) and exc.errno == errno.ENOSPC:
+                print(PROTOCOL + f"space {shutil.disk_usage(directory).free} {space.RESERVE}", flush=True)
+                raise SystemExit(73) from exc
+            if not item_key:
+                record = getattr(photo, "_asset_record", {}) or {}
+                item_key = catalog.token([self.zone, record.get("recordName") or os.urandom(16).hex()])
+            print(PROTOCOL + f"item 0 {item_key}", flush=True)
             self.issue(str(exc) if isinstance(exc, IntegrityError) else "record", name)
             counter.reset()
             return base.NOT_DOWNLOADED

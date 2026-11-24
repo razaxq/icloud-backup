@@ -5,6 +5,7 @@ Behaviour is read on every run from the JSON file named by FAKE_ICLOUDPD_CONTROL
 so a test can change it without restarting the service. Each invocation's
 arguments are appended to FAKE_ICLOUDPD_CALLS when that variable is set.
 """
+import hashlib
 import json
 import os
 import pathlib
@@ -81,6 +82,9 @@ if not hidden and library == "PrimarySync" and control.get("fail_primary"):
 
 folder = pathlib.Path(arg("--directory")) / "2026" / "01"
 folder.mkdir(parents=True, exist_ok=True)
+if control.get("space_required"):
+    print(f"FNARCHIVE/1 space 1024 {control['space_required']}", flush=True)
+    sys.exit(73)
 count = 1 if hidden else control.get("files", 1)
 total = "???" if "--until-found" in args else str(count * 2)
 log(f"Downloading {total} original,alternative,adjusted photos and videos to {folder} ...")
@@ -100,6 +104,9 @@ for index in range(count):
             time.sleep(control.get("delay", 0))
             path.write_bytes(b"fixture-" + ext.encode())
             log("Downloaded " + str(path))
+    key = hashlib.sha256(f"{library}/{hidden}/{index}".encode()).hexdigest()
+    ok = not (control.get("missing_live") and not hidden)
+    print(f"FNARCHIVE/1 item {int(ok)} {key}", flush=True)
 log("All photos and videos have been downloaded")
 if not control.get("unverified"):
     print("FNARCHIVE/1 checked", flush=True)

@@ -83,6 +83,7 @@ class ServiceTests(ServiceCase):
         job = self.wait_job("success")
         self.assertIn("4 个", job["message"])
         self.assertTrue(job["full_scan"])
+        self.assertEqual((job["checked"], job["verified"], job["downloaded"]), (2, 2, 4))
         self.assertEqual((self.dest / "2026/01/test-0.MOV").read_bytes(), b"fixture-MOV")
         self.assertEqual(self.call("/api/start", {"id": account_id})[0], 200)
         job = self.wait_job("success")
@@ -90,11 +91,45 @@ class ServiceTests(ServiceCase):
         self.assertFalse(job["full_scan"])
         state = self.state()
         self.assertEqual([item["status"] for item in state["history"]], ["success", "success"])
+        self.assertIsNotNone(state["accounts"][0]["last_quick_scan"])
+        self.assertIsNotNone(state["accounts"][0]["last_full_verified"])
+        self.assertEqual(state["history"][0]["verified"], 2)
         self.assertIsNotNone(state["accounts"][0]["last_success"])
         self.stop_service()
         stored = (self.state_dir / "archive.json").read_text()
         self.assertNotIn("test-secret", stored)
         self.assertNotIn("987654", stored)
+
+    def test_offline_verification_of_a_restored_directory(self):
+        account = self.add_account()
+        root = self.dest / "restore"
+        folder = root / ".icloud-archive"
+        folder.mkdir(parents=True)
+        key = session_path(self.state_dir / "sessions", "com", "test@example.com").name
+        name = key + ".jsonl"
+        report = [{"kind": "scan", "complete": True, "incomplete": 0, "verified": 2, "time": 1000},
+                  {"kind": "asset", "verified": True, "manifest": "a/manifest.json", "manifestSHA256": "none"},
+                  {"kind": "asset", "verified": True, "manifest": "b/manifest.json", "manifestSHA256": "none"},
+                  {"kind": "summary", "candidates": 0}]
+        (folder / name).write_text("".join(json.dumps(row) + "\n" for row in report))
+        payload = dict(id=account, root=str(root), report=name)
+        self.assertEqual(self.call("/api/reports", dict(payload, root=str(self.state_dir)))[0], 400)
+        self.assertEqual(self.call("/api/verify", dict(payload, report="unlisted.jsonl"))[0], 409)
+        self.assertEqual(self.call("/api/reports", payload)[1]["reports"][0]["total"], 2)
+        self.assertEqual(self.call("/api/verify", payload)[0], 200)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            result = self.state()["verification"]
+            if result["status"] != "running":
+                break
+            time.sleep(.02)
+        self.assertEqual((result["status"], result["checked"], result["issue_count"]), ("error", 2, 2))
+        self.assertEqual([i["path"] for i in result["issues"]], ["a/manifest.json", "b/manifest.json"])
+        self.assertTrue(result["issues_ready"])
+        self.assertFalse(self.calls())
+        self.stop_service()
+        self.start_service()
+        self.assertEqual(self.state()["verification"], result)
 
     def test_sms_code_choice(self):
         self.control({"sms": True})
@@ -456,6 +491,41 @@ class ArchiveConsistencyTests(unittest.TestCase):
         self.assertIsNone(app.accounts[0]["resume"])
         self.assertEqual(app.job["done_phases"], [])
         self.assertEqual(app.job["status"], "cancelled")
+
+    def test_low_space_pauses_then_resumes_automatically_without_double_counting(self):
+        app = self.archive()
+        account_id = app.save_account(self.payload)
+        reserve = archive_module.space.RESERVE
+        free = mock.Mock(free=reserve + 200)
+        runs = 0
+        def transfer(**options):
+            nonlocal runs
+            runs += 1
+            options["on_event"]("item", ("a", True))
+            if runs == 1:
+                raise archive_module.space.LowSpace(free.free, reserve + 1000)
+            options["on_event"]("item", ("b", False))
+            return mock.Mock(failures=["缺少配套视频"], warnings=[], review="")
+        with mock.patch.object(archive_module.shutil, "disk_usage", return_value=free), \
+                mock.patch.object(archive_module, "run_sync", side_effect=transfer), mock.patch.object(app, "notify") as notify:
+            app.start(account_id)
+            app.thread.join(5)
+            self.assertEqual(app.job["status"], "paused")
+            self.assertEqual(app.job["space_required"], reserve + 1000)
+            self.assertEqual(app.job["checked"], 1)
+            notify.assert_called_once()
+            with self.assertRaises(archive_module.RequestError):
+                app.resume_paused()
+            self.assertEqual(runs, 1)
+            free.free += 2000
+            with app.lock:
+                app.started -= app.startup_grace
+                app.job["pause_due"] = time.time() - 1
+                app.lock.notify_all()
+                self.assertTrue(app.lock.wait_for(lambda: app.job["status"] == "error", 5))
+            self.assertEqual(runs, 2)
+            self.assertEqual((app.job["checked"], app.job["verified"]), (2, 1))
+            self.assertEqual(len(app.history), 1)
 
     def test_unknown_schema_is_preserved_byte_for_byte(self):
         data = b'{"version":99,"config":{},"accounts":[{"id":"keep"}]}'

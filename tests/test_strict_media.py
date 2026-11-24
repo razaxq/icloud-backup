@@ -52,6 +52,19 @@ class FileIntegrityTests(unittest.TestCase):
         self.assertFalse(strict_cli.publish_verified(self.path, self.version,
                                                     lambda _: self.fail("verified file downloaded again")))
 
+    def test_space_for_original_is_checked_before_fetch(self):
+        payload = b"original"
+        fetch = unittest.mock.Mock()
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "original.HEIC"
+            available = strict_cli.space.RESERVE + len(payload) - 1
+            with patch.object(strict_cli.shutil, "disk_usage", return_value=SimpleNamespace(free=available)):
+                with self.assertRaises(strict_cli.space.LowSpace) as stopped:
+                    strict_cli.publish_verified(target, resource(payload), fetch)
+            self.assertEqual(stopped.exception.required, strict_cli.space.RESERVE + len(payload))
+            self.assertFalse(target.exists())
+            fetch.assert_not_called()
+
     def test_unknown_apple_digest_or_bad_payload_fails_without_final_file(self):
         self.version.checksum = base64.b64encode(b"\x02" + b"Z" * 20).decode()
         with self.assertRaisesRegex(strict_cli.IntegrityError, "signature"):
@@ -120,7 +133,8 @@ class AssetIntegrityTests(unittest.TestCase):
                                 self.client, Counter() if counter is None else counter, self.photo)
 
     def issues(self):
-        return [json.loads(line[len(strict_cli.PROTOCOL):])[0] for line in self.log.getvalue().splitlines()]
+        return [json.loads(line[len(strict_cli.PROTOCOL):])[0] for line in self.log.getvalue().splitlines()
+                if line.startswith(strict_cli.PROTOCOL + "[")]
 
     def test_original_live_pair_and_raw_companion_verified_on_disk(self):
         self.provide(self.Asset.ORIGINAL, b"full still", "public.heic")

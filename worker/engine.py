@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .strict_cli import PROTOCOL
-from . import retention
+from . import catalog, retention, space
 
 
 class SyncError(Exception):
@@ -93,6 +93,7 @@ class SyncResult:
 
 @dataclass
 class _Run:
+    zone: str = "PrimarySync"
     downloads: int = 0
     libraries: set = field(default_factory=set)
     sms_devices: list = field(default_factory=list)
@@ -109,6 +110,11 @@ class _Run:
         # URLs, account identifiers or an entire response body.
         if line.startswith(PROTOCOL):
             marker = line[len(PROTOCOL):]
+            if item := re.fullmatch(r"item ([01]) ([0-9a-f]{64})", marker):
+                on_event("item", (item[2], item[1] == "1"))
+                return
+            if low := re.fullmatch(r"space ([0-9]{1,20}) ([0-9]{1,20})", marker):
+                raise space.LowSpace(int(low[1]), max(space.RESERVE, int(low[2])))
             if marker == "checked":
                 self.checked = True
                 return
@@ -167,6 +173,8 @@ class _Run:
             on_event("warning", self.warning)
         elif lower.startswith("skipping asset ") and "master record" in lower:
             self.warning = "iCloud 未返回部分项目的主记录，需要重新完整扫描。"
+            if missing := re.match(r"Skipping asset ([^\s:]+):", message, re.I):
+                on_event("item", (catalog.token([self.zone, missing[1]]), False))
         elif lower in ("unknown album: hidden", "album not found: hidden"):
             self.missing_hidden_album = True
         elif "domain parameter" in lower:
@@ -259,9 +267,9 @@ def _stop(process):
             process.wait()
 
 
-def _invoke(binary, args, account, cwd, prompt, on_event, cancel):
+def _invoke(binary, args, account, cwd, prompt, on_event, cancel, monitor):
     _check_cancel(cancel)
-    result = _Run()
+    result = _Run(zone=args[args.index("--library") + 1] if "--library" in args else "PrimarySync")
     try:
         process = subprocess.Popen(
             [str(binary), *args], cwd=cwd, stdin=subprocess.PIPE,
@@ -279,6 +287,7 @@ def _invoke(binary, args, account, cwd, prompt, on_event, cancel):
             selector.register(process.stdout, selectors.EVENT_READ)
             while True:
                 _check_cancel(cancel)
+                monitor.poll()
                 if not selector.select(timeout=0.4):
                     continue
                 chunk = os.read(process.stdout.fileno(), 8192)
@@ -334,6 +343,7 @@ def run_sync(*, binary, username, domain, destination, session_dir,
     target = Path(destination)
     binary = Path(binary).resolve()
     cookies = session_path(session_dir, domain, username)
+    monitor = space.SpaceMonitor(target, on_event)
     try:
         cookies.mkdir(parents=True, exist_ok=True, mode=0o700)
         cookies.chmod(0o700)
@@ -342,6 +352,7 @@ def run_sync(*, binary, username, domain, destination, session_dir,
     except OSError as exc:
         raise SyncError("无法访问保存目录或私有会话目录，请检查空间和权限。") from exc
 
+    monitor.poll()
     base = ["--no-progress-bar", "--log-level", "info", "--domain", domain,
             "--password-provider", "console", "--mfa-provider", "console",
             "--username", username, "--cookie-directory", str(cookies)]
@@ -374,7 +385,7 @@ def run_sync(*, binary, username, domain, destination, session_dir,
             def invoke():
                 extra = ["--adp-web-access"] if use_adp else []
                 return _invoke(binary, [*prefix, *base, *extra, *options], username, private_workdir,
-                               prompt, on_event, cancel)
+                               prompt, on_event, cancel, monitor)
 
             code, result = invoke()
             outcome.downloaded += result.downloads
@@ -437,10 +448,13 @@ def run_sync(*, binary, username, domain, destination, session_dir,
                     download_library(library, shared_folder, f"共享图库（{_short_library(library)}）", True)
         if audit:
             complete = not outcome.failures and not outcome.warnings
+            space.check(target)
             try:
                 verified, incomplete, unassigned, selected = retention.publish_review(
                     inventory, target, cookies.name, rule, complete, recheck=resumed)
             except (ValueError, KeyError, OSError, retention.IntegrityError) as exc:
+                if isinstance(exc, OSError):
+                    space.check(target)
                 raise SyncError("归档核对报告未完成，请检查原件、目录权限和磁盘空间。") from exc
             outcome.review = (f"已生成完整档案 {verified} 份、不完整档案 {incomplete} 份，"
                               f"旧文件归属待确认 {unassigned} 份。")

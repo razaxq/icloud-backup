@@ -3,6 +3,9 @@ from contextlib import closing
 import hashlib
 import json
 import os
+import re
+import shutil
+import stat
 from pathlib import Path
 import sqlite3
 import time
@@ -153,8 +156,8 @@ def candidates(db, rule, now):
     return db.execute("SELECT manifest,digest FROM assets WHERE " + condition, params)
 
 
-def verify_manifest(root, relative, expected):
-    if Path(relative).is_absolute() or ".." in Path(relative).parts or Path(relative).name != "manifest.json":
+def verify_manifest(root, relative, expected, *, on_issue=None, check=None, durable=True):
+    if not isinstance(relative, str) or Path(relative).is_absolute() or ".." in Path(relative).parts or Path(relative).name != "manifest.json":
         raise IntegrityError("local-path")
     path = root / relative
     if not path.is_relative_to(root) or path.resolve(strict=True) != path or not path.is_file():
@@ -169,21 +172,96 @@ def verify_manifest(root, relative, expected):
     owner = {"identity": manifest["identity"], "revision": manifest["revision"]}
     if claim.is_symlink() or not claim.is_file() or claim.read_bytes() != catalog.encoded(owner):
         raise IntegrityError("inventory")
+
+    def inspect(file, valid):
+        try:
+            if file.resolve(strict=True) != file or not file.is_file():
+                raise IntegrityError("local-path")
+            if not valid():
+                raise IntegrityError("mismatch")
+        except (IntegrityError, OSError) as exc:
+            if not on_issue:
+                raise
+            on_issue(str(file.relative_to(root)), issue_reason(exc))
+
     for resource in manifest["resources"]:
-        media = path.parent / resource["name"]
-        content_hash = hashlib.sha256()
-        if (media.parent != path.parent or media.resolve(strict=True) != media
-                or not matches(media, resource["bytes"], bytes.fromhex(resource["appleChecksum"]),
-                               durable=True, content_hash=content_hash) or content_hash.hexdigest() != resource["sha256"]):
-            raise IntegrityError("mismatch")
+        name = resource["name"]
+        if not isinstance(name, str) or Path(name).name != name or name in ("", ".", ".."):
+            raise IntegrityError("local-path")
+        media = path.parent / name
+        def valid_media():
+            content_hash = hashlib.sha256()
+            return (matches(media, resource["bytes"], bytes.fromhex(resource["appleChecksum"]),
+                            durable=durable, content_hash=content_hash, check=check)
+                    and content_hash.hexdigest() == resource["sha256"])
+        inspect(media, valid_media)
         if "xmpSHA256" in resource:
-            sidecar = media.with_name(media.name + ".xmp")
-            if sidecar.resolve(strict=True) != sidecar or not present(sidecar):
-                raise IntegrityError("metadata")
-            with sidecar.open("rb") as stream:
-                if hashlib.file_digest(stream, "sha256").hexdigest() != resource["xmpSHA256"]:
-                    raise IntegrityError("metadata")
+            sidecar = media.with_name(name + ".xmp")
+            def valid_sidecar():
+                with sidecar.open("rb") as stream:
+                    return hashlib.file_digest(stream, "sha256").hexdigest() == resource["xmpSHA256"]
+            inspect(sidecar, valid_sidecar)
     return manifest
+
+
+def issue_reason(exc):
+    if isinstance(exc, FileNotFoundError):
+        return "文件缺失"
+    if isinstance(exc, OSError):
+        return "文件无法读取"
+    if isinstance(exc, IntegrityError) and str(exc) == "mismatch":
+        return "文件内容校验失败"
+    return "清单、项目身份或路径校验失败"
+
+
+def report_header(path):
+    if path.resolve(strict=True) != path or not stat.S_ISREG(path.lstat().st_mode):
+        raise IntegrityError("local-path")
+    with path.open(encoding="utf-8") as stream:
+        header = json.loads(stream.readline(65536))
+    if (not isinstance(header, dict) or header.get("kind") != "scan" or header.get("complete") is not True
+            or header.get("incomplete") != 0 or type(header.get("verified")) is not int
+            or header["verified"] < 0 or type(header.get("time")) not in (int, float)
+            or not 0 <= header["time"] < 253402300800):
+        raise IntegrityError("inventory")
+    return header
+
+
+def report_choices(root, account_key):
+    folder = root / ".icloud-archive"
+    if not folder.exists():
+        return []
+    if folder.resolve(strict=True) != folder:
+        raise IntegrityError("local-path")
+    options = {}
+    for path in folder.glob(account_key + "*.jsonl"):
+        if not re.fullmatch(re.escape(account_key) + r"(?:-[0-9]+)?\.jsonl", path.name):
+            continue
+        try:
+            header = report_header(path)
+        except (OSError, ValueError, IntegrityError):
+            continue
+        # Prefer the immutable snapshot when latest points to the same scan.
+        stamp = header["time"]
+        if stamp not in options or path.stem != account_key:
+            options[stamp] = dict(name=path.name, time=stamp, total=header["verified"])
+    return sorted(options.values(), key=lambda item: item["time"], reverse=True)
+
+
+def keep_snapshot(latest):
+    try:
+        header = report_header(latest)
+    except (FileNotFoundError, ValueError, IntegrityError):
+        return
+    path = latest.with_name(f"{latest.stem}-{int(header['time'] * 1e9)}.jsonl")
+    if path.exists():
+        return
+    try:
+        os.link(latest, path)
+    except OSError:
+        with latest.open("rb") as original, catalog.publish_file(path) as copy:
+            shutil.copyfileobj(original, copy)
+    catalog.fsync_dir(latest.parent)
 
 
 def publish_review(path, root, account_key, rule, scan_complete, *, recheck=False):
@@ -197,7 +275,9 @@ def publish_review(path, root, account_key, rule, scan_complete, *, recheck=Fals
         verified = db.execute("SELECT count(*) FROM assets WHERE complete=1").fetchone()[0]
         ready = scan_complete and not incomplete
         count = 0
-        with catalog.publish_file(folder / (account_key + ".jsonl")) as report:
+        latest = folder / (account_key + ".jsonl")
+        keep_snapshot(latest)  # Preserve a complete report from before the upgrade, too.
+        with catalog.publish_file(latest) as report:
             def emit(row):
                 report.write(catalog.encoded(row) + b"\n")
             emit(dict(kind="scan", time=now, complete=bool(ready), verified=verified,
@@ -214,28 +294,44 @@ def publish_review(path, root, account_key, rule, scan_complete, *, recheck=Fals
                     emit(dict(kind="candidate", manifest=relative))
                     count += 1
             emit(dict(kind="summary", candidates=count))
+        if ready:
+            keep_snapshot(latest)
         catalog.fsync_dir(root)
     return verified, incomplete, unassigned, count
 
 
-def verify_report(root, report):
-    """Read a saved full-scan report and verify a restored tree without an Apple session."""
+def verify_report(root, report, *, on_item=None, on_issue=None, check=None, expected_scan=None):
+    """Stream the report. CLI fails fast; the web view collects problems per file."""
     root = root.resolve(strict=True)
+    report = report.absolute()
+    header = report_header(report)
+    if expected_scan and (header["time"], header["verified"]) != expected_scan:
+        raise IntegrityError("inventory")
     seen = set()
     with report.open(encoding="utf-8") as stream:
-        header = json.loads(stream.readline())
-        if header.get("kind") != "scan" or header.get("complete") is not True or header.get("incomplete") != 0:
+        if json.loads(stream.readline()) != header:
             raise IntegrityError("inventory")
         finished = False
         for line in stream:
+            if check:
+                check()
             row = json.loads(line)
-            if finished:
+            if finished or not isinstance(row, dict):
                 raise IntegrityError("inventory")
             if row["kind"] == "asset":
-                if row.get("verified") is not True or row["manifest"] in seen:
+                relative = row["manifest"]
+                if (row.get("verified") is not True or not isinstance(relative, str) or relative in seen
+                        or Path(relative).is_absolute() or ".." in Path(relative).parts):
                     raise IntegrityError("inventory")
-                verify_manifest(root, row["manifest"], row["manifestSHA256"])
-                seen.add(row["manifest"])
+                seen.add(relative)
+                try:
+                    verify_manifest(root, relative, row["manifestSHA256"], on_issue=on_issue, check=check, durable=False)
+                except (IntegrityError, OSError, ValueError, KeyError, TypeError) as exc:
+                    if not on_issue:
+                        raise
+                    on_issue(relative, issue_reason(exc))
+                if on_item:
+                    on_item(len(seen))
             elif row["kind"] == "summary":
                 finished = True
             elif row["kind"] not in ("legacy", "candidate"):

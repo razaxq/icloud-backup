@@ -64,6 +64,11 @@ let editing = null;
 let suggestDestination = false;
 let notifyDirty = false;
 let noticeTimer;
+let verifyAccount = null;
+let reportRequest = 0;
+let loadedRoot = "";
+let dismissedVerification = "";
+let renderedIssues = "";
 let renderedAccounts = "";
 let renderedHistory = "";
 let renderedLog = [];
@@ -119,6 +124,16 @@ function showNotice(message, kind = "error") {
 
 function hidePrivateState() {
   state = null;
+  verifyAccount = null;
+  loadedRoot = "";
+  reportRequest++;
+  $("verify-panel").hidden = true;
+  $("verify-root").value = "";
+  $("verify-report").replaceChildren();
+  $("verify-issues").replaceChildren();
+  renderedIssues = "";
+  $("verify-location").textContent = "";
+  $("verify-owner").textContent = "";
   closeBrowser();
   suggestDestination = notifyDirty = false;
   renderedAccounts = renderedHistory = "";
@@ -240,7 +255,7 @@ function renderSummary() {
     title = { running: "正在归档 ", cancelling: "正在取消 · ", pausing: "正在暂停 · " }[status] + (job.account || "");
   } else if (paused) {
     title = "已暂停 · " + (job.account || "");
-    sub = (job.pause_until ? "将于 " + formatTime(job.pause_until) + " 自动继续。" : "点击「继续」后接着下载。")
+    sub = job.space_required ? job.message : (job.pause_until ? "将于 " + formatTime(job.pause_until) + " 自动继续。" : "点击「继续」后接着下载。")
       + "已下载的文件和未完成的传输都会保留，其他账户的计划任务也会等到继续或取消后再运行。";
   } else {
     title = label + (job.account ? " · " + job.account : "");
@@ -249,8 +264,17 @@ function renderSummary() {
   $("hero-sub").textContent = sub;
   $("job-bar").hidden = !(status === "running" || status === "cancelling" || status === "pausing");
 
+  $("item-progress").hidden = !Number.isInteger(job.checked);
+  $("items-checked").textContent = job.checked ?? 0;
+  $("items-verified").textContent = job.verified ?? 0;
+  $("items-incomplete").textContent = (job.checked ?? 0) - (job.verified ?? 0);
+  const gib = (bytes) => (bytes / 1024 ** 3).toLocaleString("zh-CN", { maximumFractionDigits: 2 });
+  $("disk-space").hidden = !Number.isFinite(job.free_bytes);
+  $("disk-space").textContent = "目标盘上次测得可用 " + gib(job.free_bytes ?? 0) + " GiB · 预留 "
+    + gib(state.reserve_bytes) + " GiB" + (paused && job.space_required
+      ? " · 继续本次备份需要可用空间超过 " + gib(job.space_required) + " GiB" : "");
   const counting = active || paused || (status !== "idle" && Number.isInteger(job.downloaded));
-  $("stat-first-label").textContent = counting ? (active || paused ? "本次新增" : "上次任务新增") : "账户";
+  $("stat-first-label").textContent = counting ? (active || paused ? "新写入文件" : "上次新写入文件") : "账户";
   $("stat-first-icon").setAttribute("href", counting ? "#i-download" : "#i-users");
   $("stat-first").textContent = counting ? String(job.downloaded || 0) : accounts.length + " / " + MAX_ACCOUNTS;
 
@@ -262,7 +286,7 @@ function renderSummary() {
   const pausable = PAUSABLE.has(status);
   $("hero-actions").hidden = !(active || paused);
   $("resume").hidden = !paused;
-  $("resume").disabled = busy;
+  $("resume").disabled = busy || state.verification?.status === "running";
   $("pause-wrap").hidden = !(pausable || status === "pausing");
   $("pause").disabled = busy || !pausable;
   $("pause-label").textContent = status === "pausing" ? "正在暂停…" : "暂停";
@@ -387,16 +411,19 @@ function accountCard(account, job, index) {
         el("div", { class: "account-meta" },
           retentionLabel ? el("span", {}, retentionLabel) : null, retentionLabel ? el("i") : null,
           el("span", {}, intervalLabel(account.interval_minutes)), el("i"),
-          el("span", {}, "上次成功 " + (account.last_success ? formatTime(account.last_success) : "暂无")), el("i"),
+          el("span", {}, "上次快速检查 " + (account.last_quick_scan ? formatTime(account.last_quick_scan) : "暂无")), el("i"),
+          el("span", {}, "上次完整核对 " + (account.last_full_verified ? formatTime(account.last_full_verified) : "暂无")), el("i"),
           el("span", {}, "下次 " + (account.next_run ? formatTime(account.next_run) : "未安排"))),
         last && last.message && last.status !== "success" && !runningHere
           ? el("p", { class: "account-note" }, last.message) : null)),
     el("div", { class: "account-actions" },
       el("button", {
-        type: "button", class: "btn ghost sm", disabled: busy || active, onclick: () => startAccount(account.id),
+        type: "button", class: "btn ghost sm", disabled: busy || active || state.verification?.status === "running", onclick: () => startAccount(account.id),
         title: held && !runningHere ? (job.status === "paused" ? "请先继续或取消已暂停的任务" : "其他账户的任务正在运行") : ""
       }, icon(pausedHere ? "pause" : "play"),
       runningHere ? (pausedHere ? "已暂停" : "备份中…") : "立即备份"),
+      el("button", { type: "button", class: "btn ghost sm", disabled: busy,
+        onclick: () => openVerification(account) }, "验证 NAS 备份"),
       el("button", {
         type: "button", class: "btn ghost sm icon-only", title: "编辑", "aria-label": "编辑 " + account.account,
         disabled: busy || runningHere, onclick: () => openEditor(account)
@@ -414,7 +441,7 @@ function accountCard(account, job, index) {
 function renderAccounts() {
   const accounts = state.accounts || [];
   const job = state.job || {};
-  const key = JSON.stringify([accounts, job.status, job.account_id, busy, pendingDelete]);
+  const key = JSON.stringify([accounts, job.status, job.account_id, state.verification?.status, busy, pendingDelete]);
   $("account-count").textContent = accounts.length ? accounts.length + " / " + MAX_ACCOUNTS : "";
   $("no-accounts").hidden = accounts.length > 0 || !$("editor").hidden;
   if (key === renderedAccounts) return;
@@ -600,6 +627,7 @@ function renderHistory(history) {
     el("td", { class: "ellipsis", title: item.account }, item.account),
     el("td", { class: "mode" }, (triggerLabels[item.trigger] || "—") + " · " + (item.full_scan ? "完整" : "快速")),
     el("td", { title: item.message || "" }, statusChip(item.status)),
+    el("td", { class: "num" }, Number.isInteger(item.checked) ? item.verified + " / " + item.checked : "—"),
     el("td", { class: "num" }, (item.downloaded_estimate ? "≥" : "") + String(item.downloaded ?? 0)),
     el("td", { class: "num" }, (item.downloaded_estimate && item.removed ? "≥" : "") + String(item.removed ?? 0)))));
 }
@@ -674,6 +702,61 @@ async function saveNotify() {
 
 /* ---------- settings ---------- */
 
+function openVerification(account) {
+  verifyAccount = account.id;
+  dismissedVerification = "";
+  $("verify-owner").textContent = account.account + " · 目录中需包含该账户的 .icloud-archive 报告文件夹。";
+  $("verify-root").value = account.destination;
+  renderVerification();
+  $("verify-panel").scrollIntoView({ block: "nearest" });
+  loadReports();
+}
+
+async function loadReports() {
+  const request = ++reportRequest;
+  const root = $("verify-root").value.trim();
+  loadedRoot = "";
+  $("verify-report").replaceChildren();
+  $("verify-hint").textContent = "正在读取完整扫描报告…";
+  renderVerification();
+  try {
+    const result = await api("reports", { id: verifyAccount, root });
+    if (request !== reportRequest) return;
+    loadedRoot = root;
+    $("verify-report").replaceChildren(...result.reports.map((row) =>
+      el("option", { value: row.name }, formatTime(new Date(row.time * 1000)) + " · " + row.total + " 项")));
+    $("verify-hint").textContent = result.reports.length ? "" : "此目录没有该账户可用的完整扫描报告。";
+  } catch (error) {
+    if (request === reportRequest) $("verify-hint").textContent = error.message;
+  }
+  if (request === reportRequest) renderVerification();
+}
+
+function renderVerification() {
+  const v = state?.verification || {};
+  const running = v.status === "running";
+  const key = [v.account_id, v.report, v.status, v.finished_at].join("|");
+  const result = Boolean(v.status) && (running || dismissedVerification !== key);
+  $("verify-panel").hidden = !verifyAccount && !result;
+  $("verify-form").hidden = !verifyAccount;
+  $("verify-start").disabled = busy || running || ACTIVE.has(state?.job?.status) || !loadedRoot || !$("verify-report").value;
+  $("verify-result").hidden = !result;
+  $("verify-download").hidden = !(v.issues_ready && v.issue_count);
+  $("verify-stop").hidden = !running;
+  $("verify-stop").disabled = busy;
+  $("verify-close").disabled = running;
+  if (!result) return;
+  $("verify-summary").textContent = v.message + " 已检查 " + v.checked + " / " + v.total + " 项，发现 "
+    + v.issue_count + " 个问题。" + (v.issue_count > 100 ? "显示前 100 个。" : "");
+  $("verify-location").textContent = [v.account, v.root, v.report].join(" · ");
+  const issues = JSON.stringify(v.issues || []);
+  if (issues !== renderedIssues) {
+    renderedIssues = issues;
+    $("verify-issues").replaceChildren(...(v.issues || []).map((issue) =>
+      el("li", {}, issue.reason + " · " + issue.path)));
+  }
+}
+
 function renderSettings() {
   $("about-version").textContent = state.version ? "v" + state.version : "—";
   $("about-downloader").textContent = state.downloader || "—";
@@ -727,6 +810,7 @@ function render(snapshot) {
   renderHistory(snapshot.history);
   renderNotify(snapshot.notify || {});
   renderSettings();
+  renderVerification();
   updatePathHelp();
   $("notify-fields").disabled = busy;
 }
@@ -796,6 +880,26 @@ window.addEventListener("hashchange", () => {
 });
 $("cancel").addEventListener("click", () => act(() => api("cancel", {})));
 $("resume").addEventListener("click", () => act(() => api("resume", {})));
+$("verify-load").addEventListener("click", loadReports);
+$("verify-root").addEventListener("input", () => {
+  ++reportRequest;
+  loadedRoot = "";
+  $("verify-report").replaceChildren();
+  $("verify-hint").textContent = "点击「读取报告」查看此目录中的完整扫描。";
+  renderVerification();
+});
+$("verify-start").addEventListener("click", () => act(async () => {
+  await api("verify", { id: verifyAccount, root: loadedRoot, report: $("verify-report").value });
+  dismissedVerification = "";
+}));
+$("verify-stop").addEventListener("click", () => act(() => api("verify/cancel", {})));
+$("verify-close").addEventListener("click", () => {
+  ++reportRequest;
+  verifyAccount = null;
+  const v = state.verification || {};
+  dismissedVerification = [v.account_id, v.report, v.status, v.finished_at].join("|");
+  renderVerification();
+});
 $("pause").addEventListener("click", (event) => {
   event.stopPropagation();
   const open = $("pause-menu").hidden;

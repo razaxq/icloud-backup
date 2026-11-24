@@ -176,6 +176,15 @@ class RunSyncTests(unittest.TestCase):
         self.run_sync({"fail_primary": True}, include_shared=False, on_phase=done.append)
         self.assertEqual(done, ["PrimarySync/Hidden"])
 
+    def test_transfer_reports_required_space_without_finishing_the_phase(self):
+        done = []
+        required = 12 * 1024 ** 3
+        with self.assertRaises(engine.space.LowSpace) as low:
+            self.run_sync({"space_required": required}, on_phase=done.append)
+        self.assertEqual((low.exception.free, low.exception.required), (1024, required))
+        self.assertEqual(done, [])
+        self.assertEqual(len(self.calls()), 1)
+
     def test_incremental_scan_uses_until_found(self):
         result, _ = self.run_sync(full_scan=False, include_shared=False)
         self.assertFalse(result.full_scan)

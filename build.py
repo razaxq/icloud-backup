@@ -29,7 +29,7 @@ FNPACK = {
 }
 PAYLOAD = {"web/server.py", "web/archive.py", "web/notifier.py", "web/static/index.html", "web/static/app.js",
            "web/static/style.css", "web/static/inter.woff2",
-           "worker/__init__.py", "worker/engine.py", "worker/strict_cli.py", "worker/retention.py", "worker/catalog.py", "bin/icloudpd", "bin/run.py",
+           "worker/__init__.py", "worker/engine.py", "worker/strict_cli.py", "worker/retention.py", "worker/catalog.py", "worker/space.py", "web/progress.py", "bin/icloudpd", "bin/run.py",
            "vendor/icloudpd/base.py", "vendor/pyicloud_ipd/services/photos.py", "ui/config", "ui/images/icon_64.png",
            "ui/images/icon_256.png", "licenses/icloudpd-LICENSE.md", "licenses/Inter-OFL.txt"}
 COMMANDS = {path.name for path in (ROOT / "package/cmd").iterdir() if path.is_file()}

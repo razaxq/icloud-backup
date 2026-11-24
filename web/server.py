@@ -10,6 +10,7 @@ import hmac
 from http.server import BaseHTTPRequestHandler
 import json
 import os
+import shutil
 from pathlib import Path
 import secrets
 import signal
@@ -107,6 +108,16 @@ class Handler(BaseHTTPRequestHandler):
                 self.send(302, b"", headers={"Location": self.server.prefix + "/"})
             elif path == "/api/state":
                 self.send(200, dict(archive.state(), csrf_token=self.csrf_token()))
+            elif path == "/api/verification-issues":
+                with archive.verification_issues() as stream:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/octet-stream")
+                    self.send_header("Content-Disposition", 'attachment; filename="verification-issues.jsonl"')
+                    self.send_header("Content-Length", str(os.fstat(stream.fileno()).st_size))
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("X-Content-Type-Options", "nosniff")
+                    self.end_headers()
+                    shutil.copyfileobj(stream, self.wfile)
             elif path == "/api/browse":
                 query = parse_qs(urlsplit(self.path).query)
                 value = query.get("path", [""])[0]
@@ -132,6 +143,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_asset(BASE / "static" / filename, mime)
         except RequestError as exc:
             self.send(exc.status, {"error": str(exc)})
+        except (BrokenPipeError, ConnectionResetError):
+            return  # The browser closed the page or cancelled a report download.
 
     def do_POST(self):
         try:
@@ -155,6 +168,12 @@ class Handler(BaseHTTPRequestHandler):
                 archive.delete_account(data)
             elif path == "/api/start":
                 archive.start(data.get("id"), "manual")
+            elif path == "/api/reports":
+                result = archive.reports(data)
+            elif path == "/api/verify":
+                archive.start_verification(data)
+            elif path == "/api/verify/cancel":
+                archive.cancel_verification()
             elif path == "/api/cancel":
                 archive.stop()
             elif path == "/api/pause":

@@ -7,6 +7,7 @@ and the status code the gateway answers with.
 Expects the project root and this directory on sys.path (server.py sets both
 up), so that `worker` and `notifier` import.
 """
+from contextlib import closing
 import collections
 import datetime as dt
 import json
@@ -14,6 +15,7 @@ import os
 from pathlib import Path
 import secrets
 import shutil
+import sqlite3
 import tempfile
 import threading
 import time
@@ -21,6 +23,8 @@ import traceback
 
 from worker.engine import run_sync, session_path, SyncError, SyncCancelled
 from worker.retention import policy as cleanup_policy
+from worker import catalog, retention, space
+from progress import ItemProgress
 import notifier
 
 
@@ -66,7 +70,8 @@ MAX_CRASH_RESUMES = 2
 PROMPT_TIMEOUT = {"password": 1800, "code": 600}
 IDLE_JOB = dict(status="idle", message="", updated_at=None, account_id=None, account="",
                 trigger=None, started_at=None, full_scan=True, downloaded=0, removed=0,
-                done_phases=[], pause_until=None, pause_due=None)
+                done_phases=[], pause_until=None, pause_due=None, space_required=None, free_bytes=None,
+                progress_id=None, checked=None, verified=None)
 
 
 def clean_resume(raw):
@@ -78,7 +83,9 @@ def clean_resume(raw):
     trigger = raw.get("trigger")
     if trigger == "watch":
         trigger = "schedule"
-    return dict(full=raw.get("full") is not False,
+    progress_id = raw.get("progress_id")
+    progress = {"progress_id": progress_id} if isinstance(progress_id, str) else {}
+    return dict(**progress, full=raw.get("full") is not False,
                 done=[item for item in done if isinstance(item, str)][:200] if isinstance(done, list) else [],
                 paused=raw.get("paused") is True,
                 trigger=trigger if trigger in TRIGGERS else None,
@@ -122,6 +129,9 @@ class Archive:
         self.notify_config = notifier.normalize(None)
         self.notify_status = None
         self.job = dict(IDLE_JOB)
+        self.verification = {}
+        self.verify_thread = None
+        self.verify_cancel = threading.Event()
         self.stop_reason = None
         self.pause_minutes = 0
         self.media_count = 0
@@ -181,6 +191,8 @@ class Archive:
             cleanup=cleanup,
             next_due=number(raw.get("next_due")),
             last_success=number(raw.get("last_success")),
+            last_quick_scan=number(raw.get("last_quick_scan")),
+            last_full_verified=number(raw.get("last_full_verified")),
             last_full_scan=number(raw.get("last_full_scan")),
             needs_full_scan=raw.get("needs_full_scan") is True,
             last_run=last_run if isinstance(last_run, dict) else None,
@@ -212,6 +224,20 @@ class Archive:
                         break
             self.notify_config = notifier.normalize(saved.get("notify"))
             self.history.extend(item for item in listed("history") if isinstance(item, dict))
+            for account in self.accounts:
+                baseline = account["last_full_scan"]
+                if baseline is None or account["last_success"] is None:
+                    continue
+                for entry in reversed(self.history):
+                    if entry.get("account_id") != account["id"] or entry.get("status") != "success":
+                        continue
+                    try:
+                        finished = dt.datetime.fromisoformat(entry["finished_at"]).timestamp()
+                    except (KeyError, ValueError, TypeError, OverflowError):
+                        continue
+                    field = "last_full_verified" if entry.get("full_scan") else "last_quick_scan"
+                    if account[field] is None and finished >= baseline - 1:
+                        account[field] = finished
         elif single_account:
             # Version 0.1 kept a single account under "config".
             old = saved.get("config") if isinstance(saved.get("config"), dict) else {}
@@ -220,6 +246,11 @@ class Archive:
                 self.accounts = [account]
         else:
             raise ValueError("归档配置版本与当前应用不兼容。请使用兼容版本打开，原配置已保留。")
+        verification = saved.get("verification")
+        if isinstance(verification, dict):
+            self.verification = verification
+            if verification.get("status") == "running":
+                self.verification.update(status="interrupted", message="服务已重启，请重新验档。")
         job = saved.get("job") if isinstance(saved.get("job"), dict) else {}
         self.job = dict(IDLE_JOB, **{key: job[key] for key in IDLE_JOB if key in job})
         if self.job["status"] in HELD and self.job["trigger"] == "watch":
@@ -237,7 +268,7 @@ class Archive:
             # Before 0.3, a successful run could still have missing originals.
             # Keep the audit trail and schedules, but establish a fresh baseline.
             for item in self.accounts:
-                item.update(last_success=None, last_full_scan=None, needs_full_scan=True, cleanup=cleanup_policy(), resume=None)
+                item.update(last_success=None, last_quick_scan=None, last_full_verified=None, last_full_scan=None, needs_full_scan=True, cleanup=cleanup_policy(), resume=None)
             self.job.update(done_phases=[], full_scan=True)
             if self.job["status"] == "paused":
                 self.set_job("cancelled", "归档方式已升级，请重新完整扫描。")
@@ -257,7 +288,7 @@ class Archive:
             account["crashes"] += 1
             if account["crashes"] <= MAX_CRASH_RESUMES:
                 account["resume"] = clean_resume(dict(full=bool(self.job.get("full_scan", True)),
-                                                      done=self.job.get("done_phases")))
+                                                      done=self.job.get("done_phases"), progress_id=self.job.get("progress_id")))
                 account["next_due"] = time.time() + self.resume_delay
                 message += "几分钟后会自动继续。"
             else:
@@ -273,7 +304,7 @@ class Archive:
     def persist(self):
         data = dict(version=STATE_VERSION, verification_version=VERIFICATION_VERSION,
                     accounts=self.accounts, notify=self.notify_config,
-                    job=self.job, logs=list(self.logs), history=list(self.history))
+                    job=self.job, verification=self.verification, logs=list(self.logs), history=list(self.history))
         with tempfile.NamedTemporaryFile(dir=self.state_dir, mode="w", encoding="utf-8", delete=False) as out:
             tmp = Path(out.name)
             try:
@@ -339,7 +370,8 @@ class Archive:
                      started_at=started or self.job.get("started_at") or finished, finished_at=finished,
                      status=status, downloaded=self.media_count if downloaded is None else downloaded,
                      downloaded_estimate=estimated, removed=self.job.get("removed", 0),
-                     full_scan=bool(self.job.get("full_scan", True)), message=message)
+                     full_scan=bool(self.job.get("full_scan", True)), checked=self.job.get("checked"),
+                     verified=self.job.get("verified"), message=message)
         self.history.append(entry)
         account["last_run"] = dict(status=status, message=message, finished_at=finished,
                                    downloaded=entry["downloaded"])
@@ -401,7 +433,8 @@ class Archive:
                     destination=account["destination"], interval_minutes=account["interval_minutes"],
                     include_shared=account["include_shared"], cleanup=account["cleanup"],
                     next_run=iso(account["next_due"]), last_success=iso(account["last_success"]),
-                    last_full_scan=iso(account["last_full_scan"]), last_run=account["last_run"],
+                    last_quick_scan=iso(account["last_quick_scan"]), last_full_scan=iso(account["last_full_scan"]),
+                    last_full_verified=iso(account["last_full_verified"]), last_run=account["last_run"],
                     needs_full_scan=account["needs_full_scan"],
                     resume_pending=bool(account["resume"]) and not account["resume"]["paused"])
 
@@ -416,7 +449,8 @@ class Archive:
             return dict(auth="ok", version=self.version, downloader=DOWNLOADER, roots=available,
                         default_dir=self.default_dir if self.default_dir in available else "",
                         accounts=[self._public_account(item) for item in self.accounts],
-                        job=job, logs=list(self.logs), history=list(reversed(self.history))[:20],
+                        job=job, verification=dict(self.verification, issues=list(self.verification.get("issues", []))),
+                        reserve_bytes=space.RESERVE, logs=list(self.logs), history=list(reversed(self.history))[:20],
                         notify=notify)
 
     def destination(self, value):
@@ -431,8 +465,11 @@ class Archive:
             if real.is_relative_to(self.state_dir) or self.state_dir.is_relative_to(real):
                 raise RequestError("保存目录与应用私有目录重叠，请另选目录。")
             real.mkdir(parents=True, exist_ok=True)
-            with tempfile.NamedTemporaryFile(prefix=".icloud-write-", dir=real):
-                pass
+            if shutil.disk_usage(real).free > space.RESERVE:
+                with tempfile.NamedTemporaryFile(prefix=".icloud-write-", dir=real):
+                    pass
+            elif not os.access(real, os.W_OK | os.X_OK):
+                raise RequestError("保存目录缺少写入权限。")
         except (OSError, RuntimeError) as exc:
             raise RequestError("无法写入该文件夹，请检查磁盘是否在线及应用的读写权限。") from exc
         return real
@@ -474,6 +511,111 @@ class Archive:
                     entries=[dict(name=name, path=str(real / name)) for name in names], truncated=truncated)
 
     # ----- accounts and notifications -----------------------------------
+
+    def _report_selection(self, data):
+        with self.lock:
+            account = self.find(data.get("id"))
+            roots = self.roots
+        if account is None:
+            raise RequestError("请选择要验档的账户。", 404)
+        value = data.get("root", account["destination"])
+        if not isinstance(value, str) or not Path(value).is_absolute() or ".." in Path(value).parts:
+            raise RequestError("请输入已授权的备份目录。")
+        try:
+            root = Path(value).resolve(strict=True)
+            if (not root.is_dir() or not any(root.is_relative_to(base.resolve()) for base in roots)
+                    or root.is_relative_to(self.state_dir) or self.state_dir.is_relative_to(root)):
+                raise RequestError("请选择飞牛已授权的备份目录。")
+            key = session_path(self.sessions, account["domain"], account["account"]).name
+            reports = retention.report_choices(root, key)
+        except (OSError, RuntimeError, ValueError, retention.IntegrityError) as exc:
+            raise RequestError("无法读取报告目录，请检查路径和读取权限。") from exc
+        return account, roots, root, reports
+
+    def reports(self, data):
+        _, _, root, reports = self._report_selection(data)
+        return dict(root=str(root), reports=reports)
+
+    def start_verification(self, data):
+        account, roots, root, reports = self._report_selection(data)
+        selected = next((row for row in reports if row["name"] == data.get("report")), None)
+        if not selected:
+            raise RequestError("完整扫描报告不存在，请重新读取报告列表。", 409)
+        with self.lock:
+            if (self.shutdown or self.job["status"] in ACTIVE or self.verification.get("status") == "running"
+                    or self.find(account["id"]) is not account or self.roots is not roots):
+                raise RequestError("任务或账户状态已变更，请稍后重试。", 409)
+            self.verify_cancel = threading.Event()
+            self.verification = dict(status="running", account=account["account"], account_id=account["id"],
+                                     root=str(root), report=selected["name"], total=selected["total"],
+                                     checked=0, issue_count=0, issues=[], message="正在逐项核对本地备份。")
+            self.verify_thread = threading.Thread(target=self._verify_backup, args=(root, selected, roots),
+                                                  name="verify-backup", daemon=True)
+            try:
+                self.persist()
+                self.verify_thread.start()
+            except Exception:
+                self.verification = {}
+                self.verify_thread = None
+                self.try_persist()
+                raise
+            self.lock.notify_all()
+
+    def _verify_backup(self, root, selected, roots):
+        def check():
+            if self.verify_cancel.is_set() or self.roots is not roots:
+                raise SyncCancelled("验档已停止。")
+
+        def checked(count):
+            with self.lock:
+                self.verification["checked"] = count
+
+        def issue(path, reason):
+            output.write((json.dumps(dict(path=path, reason=reason), ensure_ascii=False) + "\n").encode())
+            with self.lock:
+                self.verification["issue_count"] += 1
+                if len(self.verification["issues"]) < 100:
+                    self.verification["issues"].append(dict(path=path, reason=reason))
+
+        issues_ready = False
+        try:
+            check()
+            report = root / ".icloud-archive" / selected["name"]
+            with catalog.publish_file(self.state_dir / "verification-issues.jsonl") as output:
+                retention.verify_report(root, report, on_item=checked, on_issue=issue, check=check,
+                                        expected_scan=(selected["time"], selected["total"]))
+                check()
+            issues_ready = True
+            if self.verification["issue_count"]:
+                status, message = "error", "验档发现问题，请查看下方文件路径。"
+            else:
+                status, message = "success", "报告中的全部项目均已通过本地校验。"
+        except SyncCancelled as exc:
+            status, message = "cancelled", str(exc)
+        except (OSError, ValueError, KeyError, TypeError, RuntimeError, retention.IntegrityError):
+            status, message = "error", "报告不完整、路径不可访问或数据格式无效，验档未通过。"
+        except Exception:
+            traceback.print_exc()
+            status, message = "error", "验档未能完成，请检查应用日志。"
+        with self.lock:
+            self.verification.update(status=status, message=message, finished_at=timestamp(), issues_ready=issues_ready)
+            self.try_persist()
+            self.lock.notify_all()
+
+    def verification_issues(self):
+        with self.lock:
+            if not self.verification.get("issues_ready") or not self.verification.get("issue_count"):
+                raise RequestError("当前没有可下载的问题清单。", 404)
+            try:
+                return (self.state_dir / "verification-issues.jsonl").open("rb")
+            except OSError as exc:
+                raise RequestError("问题清单暂无法读取。", 404) from exc
+
+    def cancel_verification(self):
+        with self.lock:
+            if self.verification.get("status") != "running":
+                raise RequestError("当前没有正在运行的验档。", 409)
+            self.verify_cancel.set()
 
     def save_account(self, data):
         account = require_text(data, "account", 320).strip()
@@ -524,7 +666,7 @@ class Archive:
             updated = self._account(dict(existing or {}, account=account, domain=domain, destination=destination,
                                          interval_minutes=interval, include_shared=include_shared, cleanup=cleanup))
             if scope_changed:
-                updated.update(last_success=None, last_full_scan=None, last_run=None,
+                updated.update(last_success=None, last_quick_scan=None, last_full_verified=None, last_full_scan=None, last_run=None,
                                needs_full_scan=True, resume=None, crashes=0)
             if existing is None or existing["interval_minutes"] != interval or scope_changed:
                 if not updated["resume"]:
@@ -610,8 +752,8 @@ class Archive:
 
     def start(self, account_id, trigger="manual", scheduled_account=None):
         with self.lock:
-            if self.shutdown or self.job["status"] in ACTIVE:
-                raise RequestError("当前已有任务正在运行或停止。", 409)
+            if self.shutdown or self.job["status"] in ACTIVE or self.verification.get("status") == "running":
+                raise RequestError("请等当前备份或验档结束。", 409)
             paused = self.job["status"] == "paused"
             if trigger == "continue" and (not paused or self.job.get("account_id") != account_id):
                 raise RequestError("没有可以继续的暂停任务。", 409)
@@ -624,20 +766,28 @@ class Archive:
                 raise RequestError("自动下载计划已变更。", 409)
             roots = self.roots
         destination = self.destination(account["destination"])
+        free = shutil.disk_usage(destination).free
         with self.lock:
-            if self.shutdown or self.job["status"] in ACTIVE or (self.job["status"] == "paused") != (trigger == "continue"):
+            if (self.shutdown or self.job["status"] in ACTIVE or self.verification.get("status") == "running"
+                    or (self.job["status"] == "paused") != (trigger == "continue")):
                 raise RequestError("当前已有任务正在运行或停止。", 409)
             # save_account replaces the dictionary on every committed edit.
             # Do not combine the old validated path with a new account/schedule.
             if (self.find(account_id) is not account or roots is not self.roots or
                     (scheduled_account is not None and not self._still_due(account, trigger))):
                 raise RequestError("账户设置、自动下载计划或目录授权已更改，请重新开始。", 409)
+            if trigger == "continue" and self.job.get("space_required") and free <= self.job["space_required"]:
+                self.job.update(free_bytes=free, pause_due=time.time() + 60)
+                if scheduled_account is None:
+                    raise RequestError("空间仍不足，请释放空间后继续。", 409)
+                return
             resume, account["resume"] = account["resume"], None
             full = self._wants_full_scan(account, trigger, resume)
             continuing = trigger == "continue"
             shown = (resume.get("trigger") or "manual") if continuing and resume else trigger
-            skip = set(resume["done"]) if (resume and trigger in ("resume", "continue")
-                                           and resume["full"] == full) else set()
+            same_scan = resume and trigger in ("resume", "continue") and resume["full"] == full
+            skip = set(resume["done"]) if same_scan else set()
+            progress_id = resume.get("progress_id") if same_scan else None
             config = dict(account)
             now = timestamp()
             previous = dict(self.job)
@@ -653,7 +803,8 @@ class Archive:
                             updated_at=now, account_id=account_id, account=account["account"], trigger=shown,
                             started_at=(resume.get("started_at") or now) if continuing and resume else now,
                             full_scan=full, downloaded=self.media_count, removed=previous.get("removed", 0) if continuing else 0,
-                            done_phases=sorted(skip))
+                            done_phases=sorted(skip), progress_id=progress_id or secrets.token_hex(16),
+                            checked=0, verified=0, free_bytes=free)
             label = "完整扫描" if full else "快速检查"
             if continuing:
                 self.log("info", f"继续已暂停的{label}：{account['account']}")
@@ -780,16 +931,47 @@ class Archive:
             raise
         self.lock.notify_all()
 
+    def _run_backup(self, config, destination, full, skip):
+        private = session_path(self.sessions, config["domain"], config["account"])
+        private.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with closing(sqlite3.connect(private / "progress.sqlite")) as db:
+            progress = ItemProgress(db, self.job.get("progress_id") or secrets.token_hex(16))
+            with self.lock:
+                self.job.update(checked=progress.checked, verified=progress.verified)
+
+            def event(kind, value):
+                if kind == "space":
+                    with self.lock:
+                        self.job["free_bytes"] = value
+                elif kind == "item":
+                    progress.record(*value)
+                    with self.lock:
+                        self.job.update(checked=progress.checked, verified=progress.verified)
+                        if time.monotonic() >= self.next_progress_save:
+                            db.commit()
+                            self.next_progress_save = time.monotonic() + PROGRESS_SAVE_INTERVAL
+                            self.try_persist()
+                else:
+                    self.log(kind, value)
+
+            def phase_done(name):
+                db.commit()
+                self.phase_done(name)
+
+            try:
+                return run_sync(binary=self.binary, username=config["account"], domain=config["domain"],
+                                destination=destination, session_dir=self.sessions, prompt=self.ask,
+                                on_event=event, cancel=self.cancel, include_shared=config["include_shared"],
+                                full_scan=full, skip_phases=frozenset(skip), on_phase=phase_done,
+                                cleanup=config["cleanup"])
+            finally:
+                db.commit()
+
     def download(self, config, destination, full, skip=frozenset()):
         warnings, failures = [], []
-        outcome = None
+        low = None
         try:
-            outcome = run_sync(binary=self.binary, username=config["account"], domain=config["domain"],
-                               destination=destination, session_dir=self.sessions, prompt=self.ask,
-                               on_event=self.log, cancel=self.cancel,
-                               include_shared=config["include_shared"], full_scan=full,
-                               skip_phases=frozenset(skip),
-                               on_phase=self.phase_done, cleanup=config["cleanup"])
+            outcome = self._run_backup(config, destination, full, skip)
             warnings, failures = outcome.warnings, outcome.failures
             count = f"本次新下载 {self.media_count} 个媒体文件。"
             if failures:
@@ -803,6 +985,9 @@ class Archive:
                 message = ("完整扫描" if full else "快速检查") + "完成，" + count
             if outcome.review:
                 message += " " + outcome.review
+        except space.LowSpace as exc:
+            low = exc
+            status, message = "paused", "目标盘空间不足，备份已暂停。"
         except SyncCancelled:
             status, message = "cancelled", "任务已取消，已下载的文件保存在原目录。"
         except SyncError as exc:
@@ -829,7 +1014,9 @@ class Archive:
                 for line in failures + warnings:
                     self.log("warning", line)
             if account and status == "paused":
-                self._record_pause(account, full)
+                self._record_pause(account, full, low if not self.cancel.is_set() else None)
+                if low and self.job.get("space_required") and not self.attended():
+                    self.notify("error", notifier.APP_TITLE + "：空间不足", "备份已暂停，释放目标盘空间后会自动继续。")
                 self.try_persist()
                 self.lock.notify_all()
                 return
@@ -838,7 +1025,7 @@ class Archive:
                     account["needs_full_scan"] = True
                 if status == "interrupted":
                     account["resume"] = dict(full=full, done=list(self.job["done_phases"]), paused=False,
-                                             trigger=None, started_at=None, downloaded=0)
+                                             trigger=None, started_at=None, downloaded=0, progress_id=self.job.get("progress_id"))
                     account["next_due"] = time.time()
                 else:
                     account["resume"] = None
@@ -849,6 +1036,10 @@ class Archive:
                         if full:
                             account["last_full_scan"] = time.time()
                             account["needs_full_scan"] = False
+                            if status == "success":
+                                account["last_full_verified"] = account["last_full_scan"]
+                        elif status == "success":
+                            account["last_quick_scan"] = time.time()
                 self._finish_record(account, status, message)
             self.set_job(status, message)
             self.log("info", message)
@@ -866,12 +1057,16 @@ class Archive:
             self.notify(status, f"{notifier.APP_TITLE}：{title}",
                         f"{notifier.mask_account(config['account'])}：{title}。{summary}")
 
-    def _record_pause(self, account, full):
+    def _record_pause(self, account, full, low=None):
         until = time.time() + self.pause_minutes * 60 if self.pause_minutes else None
         account["resume"] = dict(full=full, done=list(self.job["done_phases"]), paused=True,
                                  trigger=self.job.get("trigger"), started_at=self.job.get("started_at"),
-                                 downloaded=self.media_count)
+                                 downloaded=self.media_count, progress_id=self.job.get("progress_id"))
         message = ("已暂停，将在设定时间自动继续。" if until else "已暂停，点击「继续」后接着下载。")
+        if low:
+            self.job.update(space_required=low.required, free_bytes=low.free)
+            until = time.time() + 60
+            message = "目标盘空间不足，备份已暂停。每分钟检查一次，空间足够后自动继续。"
         self.set_job("paused", message, pause_until=timestamp(until) if until else None, pause_due=until)
         self.log("info", message)
 
@@ -929,7 +1124,8 @@ class Archive:
             with self.lock:
                 if self.shutdown:
                     return
-                candidate = None if self.job["status"] in ACTIVE else self._next_due()
+                busy = self.job["status"] in ACTIVE or self.verification.get("status") == "running"
+                candidate = None if busy else self._next_due()
                 if candidate is None:
                     self.lock.wait(timeout=60)
                     continue
@@ -956,9 +1152,12 @@ class Archive:
     def close(self):
         with self.lock:
             self.shutdown = True
+            self.verify_cancel.set()
             if self.job["status"] in ACTIVE and self.job["status"] != "pausing":
                 self.stop()
             self.lock.notify_all()
         if self.thread:
             self.thread.join()
+        if self.verify_thread:
+            self.verify_thread.join()
         self.scheduler.join()

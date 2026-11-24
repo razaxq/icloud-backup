@@ -77,6 +77,12 @@
             <h1 id="hero-title">照片归档已就绪</h1>
             <p class="hero-sub" id="hero-sub"></p>
           </div>
+          <dl class="item-progress" id="item-progress" hidden>
+            <div><dt>已检查项目</dt><dd id="items-checked">0</dd></div>
+            <div><dt>原件齐全</dt><dd id="items-verified">0</dd></div>
+            <div><dt>未完整</dt><dd id="items-incomplete">0</dd></div>
+          </dl>
+          <p class="hint" id="disk-space" hidden></p>
           <div class="activity-bar" id="job-bar" aria-hidden="true" hidden><i></i></div>
           <div class="hero-actions" id="hero-actions" hidden>
             <button id="resume" class="btn primary sm" type="button" hidden><svg class="icon" aria-hidden="true"><use href="#i-play"/></svg>继续</button>
@@ -99,6 +105,30 @@
       </section>
 
 
+      <section class="panel" id="verify-panel" aria-labelledby="verify-heading" hidden>
+        <div class="panel-head"><h2 id="verify-heading">验证 NAS 备份</h2>
+          <button type="button" class="btn text sm" id="verify-close">收起</button></div>
+        <div class="settings-body">
+          <div id="verify-form" hidden>
+            <p class="hint" id="verify-owner"></p>
+            <div class="form-grid">
+              <div class="field"><label for="verify-root">待验证的备份或还原目录</label>
+                <div class="form-footer"><input id="verify-root" type="text" class="mono" maxlength="4096">
+                  <button type="button" class="btn ghost sm" id="verify-load">读取报告</button></div></div>
+              <div class="field"><label for="verify-report">完整扫描报告</label>
+                <select id="verify-report"></select></div>
+            </div>
+            <div class="form-footer"><button type="button" class="btn primary sm" id="verify-start">开始验档</button>
+              <span class="hint" id="verify-hint"></span></div>
+          </div>
+          <div id="verify-result" hidden>
+            <p id="verify-summary" role="status"></p><p class="hint mono" id="verify-location"></p>
+            <ul id="verify-issues"></ul>
+            <a id="verify-download" class="btn ghost sm" href="./api/verification-issues" download hidden>下载完整问题清单</a>
+            <button type="button" class="btn ghost sm" id="verify-stop" hidden>停止验档</button>
+          </div>
+        </div>
+      </section>
       <div class="workspace">
         <section class="panel accounts" id="accounts-card" aria-labelledby="accounts-heading">
           <div class="panel-head">
@@ -249,7 +279,7 @@
         </div>
         <div class="table-wrap" id="history-wrap" hidden>
           <table class="history" id="history">
-            <thead><tr><th scope="col">完成时间</th><th scope="col">账户</th><th scope="col">方式</th><th scope="col">结果</th><th scope="col" class="num">新增</th><th scope="col" class="num">云端删除</th></tr></thead>
+            <thead><tr><th scope="col">完成时间</th><th scope="col">账户</th><th scope="col">方式</th><th scope="col">结果</th><th scope="col" class="num">原件齐全 / 已检查</th><th scope="col" class="num">新写入文件</th><th scope="col" class="num">云端删除</th></tr></thead>
             <tbody></tbody>
           </table>
         </div>

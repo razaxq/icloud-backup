@@ -118,6 +118,28 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(set(m["missing"]), {"raw", "auxiliary"})
         self.assertIn("IMG_1234567.HEIC", [r["name"] for r in m["resources"]])
 
+    def test_reports_by_date_and_all_damaged_companions(self):
+        db_path = self.inventory()
+        self.provide(self.Asset.ORIGINAL, b"still", "public.heic")
+        self.provide(self.Live.ORIGINAL, b"movie", "com.apple.quicktime-movie")
+        self.assertTrue(self.archive_one().present)
+        self.db.commit()
+        for stamp in (1000, 2000):
+            with patch.object(retention.time, "time", return_value=stamp):
+                retention.publish_review(db_path, self.folder, "account", retention.policy(), True)
+        options = retention.report_choices(self.folder, "account")
+        self.assertEqual([r["time"] for r in options], [2000, 1000])
+        report = self.folder / ".icloud-archive" / options[-1]["name"]
+        self.assertEqual(retention.verify_report(self.folder, report), 1)
+        next(self.folder.rglob("*.MOV")).unlink()
+        next(self.folder.rglob("*.HEIC")).write_bytes(b"bad")
+        issues = []
+        self.assertEqual(retention.verify_report(self.folder, report,
+                         on_issue=lambda path, reason: issues.append((Path(path).suffix, reason))), 1)
+        self.assertCountEqual(issues, [(".MOV", "文件缺失"), (".HEIC", "文件内容校验失败")])
+        retention.publish_review(db_path, self.folder, "account", retention.policy(), False)
+        self.assertEqual(retention.report_choices(self.folder, "account"), options)
+
     def test_shared_zone_owner_and_partial_scans(self):
         from worker import catalog
         self.inventory()
