@@ -19,7 +19,7 @@ import threading
 import time
 import traceback
 
-from worker.engine import run_sync, session_path, SyncError, SyncCancelled, WATCH_RECENT
+from worker.engine import run_sync, session_path, SyncError, SyncCancelled
 from worker.retention import policy as cleanup_policy
 import notifier
 
@@ -48,19 +48,17 @@ def number(value):
     return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
 
 
-STATE_VERSION = 2
+STATE_VERSION = 3
 VERIFICATION_VERSION = 2
 ACTIVE = {"running", "waiting_password", "waiting_code", "cancelling", "pausing"}
 PAUSABLE = {"running", "waiting_password", "waiting_code"}
 HELD = ACTIVE | {"paused"}  # the job owns the single download slot
-TRIGGERS = ("manual", "schedule", "resume", "watch")
+TRIGGERS = ("manual", "schedule", "resume")
 PAUSE_MINUTES = (0, 30, 120)
-WATCH_MINUTES = (5, 10, 15, 30, 60)
-WATCH_RETRY_MAX = 6 * 3600
 DOWNLOADER = "icloudpd 1.33.0"
-DEFAULT_SETTINGS = dict(watch_minutes=10)
-INTERVALS = (0, 1, 6, 12, 24, 168)
-SCAN_MODES = ("auto", "full")
+SHORT_INTERVALS = (5, 10, 15, 30, 60)
+LEGACY_HOURS = (0, 1, 6, 12, 24, 168)
+INTERVALS = (0, *SHORT_INTERVALS, 360, 720, 1440, 10080)
 FULL_SCAN_EVERY = 7 * 86400
 PROGRESS_SAVE_INTERVAL = 15
 MAX_ACCOUNTS = 10
@@ -68,7 +66,7 @@ MAX_CRASH_RESUMES = 2
 PROMPT_TIMEOUT = {"password": 1800, "code": 600}
 IDLE_JOB = dict(status="idle", message="", updated_at=None, account_id=None, account="",
                 trigger=None, started_at=None, full_scan=True, downloaded=0, removed=0,
-                done_phases=[], watch=False, pause_until=None, pause_due=None)
+                done_phases=[], pause_until=None, pause_due=None)
 
 
 def clean_resume(raw):
@@ -77,19 +75,32 @@ def clean_resume(raw):
         return None
     done = raw.get("done")
     downloaded = raw.get("downloaded")
+    trigger = raw.get("trigger")
+    if trigger == "watch":
+        trigger = "schedule"
     return dict(full=raw.get("full") is not False,
                 done=[item for item in done if isinstance(item, str)][:200] if isinstance(done, list) else [],
-                paused=raw.get("paused") is True, watch=raw.get("watch") is True,
-                trigger=raw.get("trigger") if raw.get("trigger") in TRIGGERS else None,
+                paused=raw.get("paused") is True,
+                trigger=trigger if trigger in TRIGGERS else None,
                 started_at=raw.get("started_at") if isinstance(raw.get("started_at"), str) else None,
                 downloaded=downloaded if type(downloaded) is int and downloaded >= 0 else 0)
 
 
-def clean_settings(raw):
-    raw = raw if isinstance(raw, dict) else {}
-    minutes = raw.get("watch_minutes")
-    return dict(DEFAULT_SETTINGS, watch_minutes=minutes if type(minutes) is int and minutes in WATCH_MINUTES
-                else DEFAULT_SETTINGS["watch_minutes"])
+def legacy_interval(raw):
+    hours = raw.get("interval_hours")
+    return hours * 60 if type(hours) is int and hours in LEGACY_HOURS else None
+
+
+def migrate_schedule(raw, watch_minutes):
+    interval = legacy_interval(raw) or 0
+    due = number(raw.get("next_due"))
+    if raw.get("watch") is True:
+        interval = min(interval, watch_minutes) if interval else watch_minutes
+        if not raw.get("resume") and not raw.get("watch_suspended"):
+            watch_due = number(raw.get("watch_due"))
+            dates = [date for date in (due, watch_due) if date is not None]
+            due = min(dates) if dates else time.time() + interval * 60
+    return dict(raw, interval_minutes=interval, next_due=due)
 
 
 class Archive:
@@ -110,13 +121,9 @@ class Archive:
         self.accounts = []
         self.notify_config = notifier.normalize(None)
         self.notify_status = None
-        self.settings = clean_settings(None)
         self.job = dict(IDLE_JOB)
-        self.previous_job = None
         self.stop_reason = None
         self.pause_minutes = 0
-        self.prompted = False
-        self.escalated = False
         self.media_count = 0
         self.next_progress_save = 0.0
         self.last_event = None
@@ -158,10 +165,8 @@ class Archive:
     @staticmethod
     def _account(raw):
         raw = raw if isinstance(raw, dict) else {}
-        interval = raw.get("interval_hours")
+        interval = raw.get("interval_minutes")
         last_run = raw.get("last_run")
-        libraries = raw.get("libraries")
-        failures = raw.get("watch_failures")
         try:
             cleanup = cleanup_policy(**raw.get("cleanup", {}))
         except (TypeError, ValueError):
@@ -171,8 +176,7 @@ class Archive:
             account=str(raw.get("account") or ""),
             domain=raw.get("domain") if raw.get("domain") in ("com", "cn") else "com",
             destination=str(raw.get("destination") or ""),
-            interval_hours=interval if type(interval) is int and interval in INTERVALS else 0,
-            scan=raw.get("scan") if raw.get("scan") in SCAN_MODES else "auto",
+            interval_minutes=interval if type(interval) is int and interval in INTERVALS else 0,
             include_shared=raw.get("include_shared") is not False,
             cleanup=cleanup,
             next_due=number(raw.get("next_due")),
@@ -182,13 +186,6 @@ class Archive:
             last_run=last_run if isinstance(last_run, dict) else None,
             crashes=raw.get("crashes") if type(raw.get("crashes")) is int else 0,
             resume=clean_resume(raw.get("resume")),
-            watch=raw.get("watch") is True,
-            watch_due=number(raw.get("watch_due")),
-            watch_failures=failures if type(failures) is int and failures >= 0 else 0,
-            watch_suspended=raw.get("watch_suspended") is True,
-            watch_note=raw.get("watch_note") if isinstance(raw.get("watch_note"), str) else None,
-            last_checked=number(raw.get("last_checked")),
-            libraries=[item for item in libraries if isinstance(item, str)][:50] if isinstance(libraries, list) else [],
         )
 
     def _load(self, saved):
@@ -201,22 +198,32 @@ class Archive:
         if "verification_version" in saved and (type(saved["verification_version"]) is not int or
                                                 saved["verification_version"] not in (1, VERIFICATION_VERSION)):
             raise ValueError("原件校验记录版本与当前应用不兼容。原配置已保留。")
-        if type(version) is int and version == STATE_VERSION:
-            self.accounts = [self._account(item) for item in listed("accounts") if isinstance(item, dict)]
-            self.accounts = self.accounts[:MAX_ACCOUNTS]
+        settings = saved.get("settings")
+        watch_minutes = settings.get("watch_minutes") if isinstance(settings, dict) else None
+        if type(watch_minutes) is not int or watch_minutes not in SHORT_INTERVALS:
+            watch_minutes = 10
+        if type(version) is int and version in (2, STATE_VERSION):
+            for item in listed("accounts"):
+                if isinstance(item, dict):
+                    if version == 2:
+                        item = migrate_schedule(item, watch_minutes)
+                    self.accounts.append(self._account(item))
+                    if len(self.accounts) == MAX_ACCOUNTS:
+                        break
             self.notify_config = notifier.normalize(saved.get("notify"))
-            self.settings = clean_settings(saved.get("settings"))
             self.history.extend(item for item in listed("history") if isinstance(item, dict))
         elif single_account:
             # Version 0.1 kept a single account under "config".
             old = saved.get("config") if isinstance(saved.get("config"), dict) else {}
             if old.get("account"):
-                account = self._account(dict(old, next_due=saved.get("next_due")))
+                account = self._account(migrate_schedule(dict(old, next_due=saved.get("next_due")), watch_minutes))
                 self.accounts = [account]
         else:
             raise ValueError("归档配置版本与当前应用不兼容。请使用兼容版本打开，原配置已保留。")
         job = saved.get("job") if isinstance(saved.get("job"), dict) else {}
         self.job = dict(IDLE_JOB, **{key: job[key] for key in IDLE_JOB if key in job})
+        if self.job["status"] in HELD and self.job["trigger"] == "watch":
+            self.job["trigger"] = "schedule"
         if not isinstance(self.job["done_phases"], list):
             self.job["done_phases"] = []
         if self.job["status"] == "paused" and (self.find(self.job.get("account_id")) is None or
@@ -239,7 +246,7 @@ class Archive:
                     entry.update(status="unverified", message="旧版记录需要重新核对图库身份和原件。" + str(entry.get("message", "")))
         if self.job["status"] in ACTIVE:
             self._recover_crash()
-        if migrate or self.job["status"] == "interrupted":
+        if version != STATE_VERSION or migrate or self.job["status"] == "interrupted":
             self.persist()
 
     def _recover_crash(self):
@@ -264,14 +271,9 @@ class Archive:
         self.set_job("interrupted", message)
 
     def persist(self):
-        # Keep the v2 envelope readable on rollback. A 0.2.x write drops
-        # verification_version, so the next upgrade validates those files again.
-        # Other requests can save settings while a metadata-only probe is running.
-        # Only a real download should be recovered as an interrupted job.
-        durable_job = self.previous_job if self.job.get("watch") and self.previous_job is not None else self.job
         data = dict(version=STATE_VERSION, verification_version=VERIFICATION_VERSION,
-                    accounts=self.accounts, notify=self.notify_config, settings=self.settings,
-                    job=durable_job, logs=list(self.logs), history=list(self.history))
+                    accounts=self.accounts, notify=self.notify_config,
+                    job=self.job, logs=list(self.logs), history=list(self.history))
         with tempfile.NamedTemporaryFile(dir=self.state_dir, mode="w", encoding="utf-8", delete=False) as out:
             tmp = Path(out.name)
             try:
@@ -302,16 +304,6 @@ class Archive:
 
     def log(self, kind, message):
         with self.lock:
-            if kind == "begin":
-                # A real-time probe found new items: from here on this is a normal,
-                # visible quick check that is recorded and can be resumed.
-                self.escalated = True
-                self.logs.clear()
-                self.last_event = None
-                self.job.update(watch=False, message=message, updated_at=timestamp())
-                self.logs.append(f"{dt.datetime.now().astimezone():%H:%M:%S}  实时检测：{message}")
-                self.try_persist()
-                return
             if kind == "download":
                 self.media_count += 1
                 self.job["downloaded"] = self.media_count
@@ -331,33 +323,14 @@ class Archive:
                 self.try_persist()
 
     def schedule_next(self, account):
-        hours = account["interval_hours"]
-        account["next_due"] = time.time() + 3600 * hours if hours else None
+        minutes = account["interval_minutes"]
+        account["next_due"] = time.time() + 60 * minutes if minutes else None
 
     def phase_done(self, name):
         with self.lock:
             if name not in self.job["done_phases"]:
                 self.job["done_phases"] = [*self.job["done_phases"], name]
-            if not self.job.get("watch"):
-                self.try_persist()
-
-    def watch_interval(self):
-        return self.settings["watch_minutes"] * 60
-
-    def schedule_watch(self, account, *, failed=False):
-        """Next real-time probe; failures back off exponentially up to six hours."""
-        if not account["watch"]:
-            account["watch_due"] = None
-            return
-        if failed:
-            account["watch_failures"] += 1
-        delay = min(self.watch_interval() * 2 ** min(account["watch_failures"], 10), WATCH_RETRY_MAX)
-        account["watch_due"] = time.time() + delay
-
-    @staticmethod
-    def _watching(account):
-        return (account["watch"] and not account["watch_suspended"] and account["watch_due"] is not None
-                and not account["resume"])
+            self.try_persist()
 
     def _finish_record(self, account, status, message, *, finished=None, started=None, downloaded=None, estimated=False):
         finished = finished or timestamp()
@@ -425,18 +398,12 @@ class Archive:
         def iso(value):
             return timestamp(value) if value else None
         return dict(id=account["id"], account=account["account"], domain=account["domain"],
-                    destination=account["destination"], interval_hours=account["interval_hours"],
-                    scan=account["scan"], include_shared=account["include_shared"], cleanup=account["cleanup"],
+                    destination=account["destination"], interval_minutes=account["interval_minutes"],
+                    include_shared=account["include_shared"], cleanup=account["cleanup"],
                     next_run=iso(account["next_due"]), last_success=iso(account["last_success"]),
                     last_full_scan=iso(account["last_full_scan"]), last_run=account["last_run"],
                     needs_full_scan=account["needs_full_scan"],
-                    resume_pending=bool(account["resume"]) and not account["resume"]["paused"],
-                    watch=account["watch"],
-                    watch_state=("off" if not account["watch"] else "suspended" if account["watch_suspended"]
-                                 else "retry" if account["watch_failures"] else "on"),
-                    watch_next=iso(account["watch_due"]) if self._watching(account) else None,
-                    watch_note=account["watch_note"] if account["watch"] else None,
-                    last_checked=iso(account["last_checked"]))
+                    resume_pending=bool(account["resume"]) and not account["resume"]["paused"])
 
     def state(self):
         available = self._display_roots()
@@ -447,7 +414,6 @@ class Archive:
             notify = notifier.public(self.notify_config)
             notify["last"] = self.notify_status
             return dict(auth="ok", version=self.version, downloader=DOWNLOADER, roots=available,
-                        settings=dict(self.settings, watch_choices=list(WATCH_MINUTES), watch_recent=WATCH_RECENT),
                         default_dir=self.default_dir if self.default_dir in available else "",
                         accounts=[self._public_account(item) for item in self.accounts],
                         job=job, logs=list(self.logs), history=list(reversed(self.history))[:20],
@@ -514,13 +480,11 @@ class Archive:
         if not account or account.startswith("-") or any(c.isspace() for c in account):
             raise RequestError("请输入有效的 Apple 账户。")
         domain = data.get("domain")
-        interval = data.get("interval_hours")
-        scan = data.get("scan", "auto")
+        interval = data.get("interval_minutes", legacy_interval(data))
         include_shared = data.get("include_shared", True)
-        watch = data.get("watch", False)
         if (domain not in ("com", "cn") or type(interval) is not int or interval not in INTERVALS
-                or scan not in SCAN_MODES or not isinstance(include_shared, bool) or not isinstance(watch, bool)):
-            raise RequestError("服务地区、自动下载间隔或扫描方式无效。")
+                or not isinstance(include_shared, bool)):
+            raise RequestError("服务地区、自动备份频率或共享图库设置无效。")
         with self.lock:
             roots = self.roots
         destination = str(self.destination(require_text(data, "destination", 4096)))
@@ -558,17 +522,11 @@ class Archive:
                 raise RequestError("另一个账户已经使用这个文件夹。共用目录会混合保存双方的照片和隐藏项目。",
                                    409, "destination_in_use")
             updated = self._account(dict(existing or {}, account=account, domain=domain, destination=destination,
-                                         interval_hours=interval, scan=scan, include_shared=include_shared,
-                                         watch=watch, cleanup=cleanup))
-            if not existing or existing["watch"] != watch or scope_changed:
-                updated.update(watch_failures=0, watch_suspended=False, watch_note=None)
-                if scope_changed:
-                    updated["libraries"] = []
-                self.schedule_watch(updated)
+                                         interval_minutes=interval, include_shared=include_shared, cleanup=cleanup))
             if scope_changed:
                 updated.update(last_success=None, last_full_scan=None, last_run=None,
                                needs_full_scan=True, resume=None, crashes=0)
-            if existing is None or existing["interval_hours"] != interval or scope_changed:
+            if existing is None or existing["interval_minutes"] != interval or scope_changed:
                 if not updated["resume"]:
                     self.schedule_next(updated)
             if identity_changed:
@@ -619,25 +577,6 @@ class Archive:
                 self.notify_config = previous
                 raise
 
-    def save_settings(self, data):
-        minutes = data.get("watch_minutes")
-        if type(minutes) is not int or minutes not in WATCH_MINUTES:
-            raise RequestError("实时检测间隔无效。")
-        with self.lock:
-            previous = (self.settings, [item["watch_due"] for item in self.accounts])
-            self.settings = clean_settings(dict(self.settings, watch_minutes=minutes))
-            for account in self.accounts:
-                if self._watching(account):
-                    self.schedule_watch(account)
-            try:
-                self.persist()
-            except OSError:
-                self.settings = previous[0]
-                for account, due in zip(self.accounts, previous[1]):
-                    account["watch_due"] = due
-                raise
-            self.lock.notify_all()
-
     def test_notify(self):
         with self.lock:
             config = json.loads(json.dumps(self.notify_config))
@@ -656,26 +595,16 @@ class Archive:
     # ----- jobs --------------------------------------------------------
 
     def _wants_full_scan(self, account, trigger, resume):
-        if account["cleanup"]["mode"] != "off":
-            return True
-        if trigger == "continue" and resume:
-            return resume["full"]  # the same job, picked up where it was paused
-        if trigger == "watch":
-            return False
-        if trigger == "manual" or account["scan"] == "full" or account["needs_full_scan"]:
-            return True
-        if trigger == "resume" and resume:
-            return resume["full"]
         last = account["last_full_scan"]
-        return last is None or time.time() - last >= FULL_SCAN_EVERY
+        return (account["cleanup"]["mode"] != "off" or account["needs_full_scan"]
+                or last is None or time.time() - last >= FULL_SCAN_EVERY
+                or bool(trigger in ("resume", "continue") and resume and resume["full"]))
 
     def _still_due(self, account, trigger):
         now = time.time()
         if trigger == "continue":
             return (self.job["status"] == "paused" and self.job.get("account_id") == account["id"]
                     and self.job.get("pause_due") is not None and self.job["pause_due"] <= now)
-        if trigger == "watch":
-            return self._watching(account) and account["watch_due"] <= now
         return (account["next_due"] is not None and account["next_due"] <= now
                 and bool(account["resume"]) == (trigger == "resume"))
 
@@ -707,40 +636,33 @@ class Archive:
             full = self._wants_full_scan(account, trigger, resume)
             continuing = trigger == "continue"
             shown = (resume.get("trigger") or "manual") if continuing and resume else trigger
-            probe = trigger == "watch" or (continuing and bool(resume) and resume["watch"])
             skip = set(resume["done"]) if (resume and trigger in ("resume", "continue")
-                                           and resume["full"] == full and not probe) else set()
+                                           and resume["full"] == full) else set()
             config = dict(account)
             now = timestamp()
             previous = dict(self.job)
             self.cancel = threading.Event()
             self.stop_reason = None
-            self.prompted = False
-            self.escalated = False
-            # A probe that finds nothing restores what the page showed before it.
-            self.previous_job = (dict(IDLE_JOB) if continuing else previous) if probe else None
-            if not probe and not continuing:
+            if not continuing:
                 self.logs.clear()
             self.media_count = (resume or {}).get("downloaded", 0) if continuing else 0
             self.next_progress_save = 0.0
             self.last_event = None
-            if shown != "watch":
-                account["next_due"] = None
-            self.job = dict(IDLE_JOB, status="running", message="正在检查 iCloud 中最新的项目。" if probe else "正在连接 iCloud。",
+            account["next_due"] = None
+            self.job = dict(IDLE_JOB, status="running", message="正在连接 iCloud。",
                             updated_at=now, account_id=account_id, account=account["account"], trigger=shown,
                             started_at=(resume.get("started_at") or now) if continuing and resume else now,
                             full_scan=full, downloaded=self.media_count, removed=previous.get("removed", 0) if continuing else 0,
-                            done_phases=sorted(skip), watch=probe)
+                            done_phases=sorted(skip))
             label = "完整扫描" if full else "快速检查"
-            if continuing and not probe:
+            if continuing:
                 self.log("info", f"继续已暂停的{label}：{account['account']}")
-            elif not probe:
+            else:
                 prefix = {"manual": "", "schedule": "定时", "resume": "继续上次中断的"}[trigger]
                 self.log("info", f"开始{prefix}{label}：{account['account']}")
             try:
-                if not probe or continuing:
-                    self.persist()
-                self.thread = threading.Thread(target=self.download, args=(config, destination, full, probe, skip),
+                self.persist()
+                self.thread = threading.Thread(target=self.download, args=(config, destination, full, skip),
                                                name="download", daemon=True)
                 self.thread.start()
             except Exception:
@@ -749,12 +671,10 @@ class Archive:
                 if continuing:
                     account.update(resume=resume, next_due=config["next_due"])
                     self.job = previous
-                    self.previous_job = None
                 else:
-                    self.set_job("error", message, watch=False)
+                    self.set_job("error", message)
                     account["needs_full_scan"] = True
                     self.schedule_next(account)
-                    self.schedule_watch(account, failed=probe)
                     self._finish_record(account, "error", message)
                 self.log("warning", message)
                 self.try_persist()
@@ -769,7 +689,6 @@ class Archive:
             if self.cancel.is_set():
                 raise SyncCancelled("已取消下载。")
             self.answer = None
-            self.prompted = True
             self.prompt_id = secrets.token_hex(12)
             self.prompt_kind = kind
             self.set_job("waiting_password" if kind == "password" else "waiting_code", message)
@@ -846,10 +765,8 @@ class Archive:
         if account:
             resume, account["resume"] = account["resume"], None
             account["crashes"] = 0
-            if not (resume and resume["trigger"] == "watch"):
-                self.schedule_next(account)
-            self.schedule_watch(account)
-            if resume and not resume["watch"]:
+            self.schedule_next(account)
+            if resume:
                 self._finish_record(account, "cancelled", message, downloaded=resume["downloaded"])
         self.set_job("cancelled", message, pause_until=None, pause_due=None)
         self.log("info", message)
@@ -863,15 +780,15 @@ class Archive:
             raise
         self.lock.notify_all()
 
-    def download(self, config, destination, full, probe=False, skip=frozenset()):
+    def download(self, config, destination, full, skip=frozenset()):
         warnings, failures = [], []
         outcome = None
         try:
             outcome = run_sync(binary=self.binary, username=config["account"], domain=config["domain"],
                                destination=destination, session_dir=self.sessions, prompt=self.ask,
                                on_event=self.log, cancel=self.cancel,
-                               include_shared=config["include_shared"], full_scan=full, watch=probe,
-                               known_libraries=config["libraries"], skip_phases=frozenset(skip),
+                               include_shared=config["include_shared"], full_scan=full,
+                               skip_phases=frozenset(skip),
                                on_phase=self.phase_done, cleanup=config["cleanup"])
             warnings, failures = outcome.warnings, outcome.failures
             count = f"本次新下载 {self.media_count} 个媒体文件。"
@@ -908,19 +825,11 @@ class Archive:
             account = self.find(config["id"])
             if self.job.get("removed") and status != "paused":
                 message += f" iCloud 已确认删除 {self.job['removed']} 个已备份项目。"
-            quiet = probe and not self.escalated and status != "paused"
-            if quiet:
-                self._finish_probe(account, status, message, outcome)
-                self.lock.notify_all()
-                return
             if status != "paused":
                 for line in failures + warnings:
                     self.log("warning", line)
-            listed = getattr(outcome, "libraries", None)
-            if account and isinstance(listed, list):
-                account["libraries"] = listed
             if account and status == "paused":
-                self._record_pause(account, full, probe and not self.escalated)
+                self._record_pause(account, full)
                 self.try_persist()
                 self.lock.notify_all()
                 return
@@ -929,28 +838,19 @@ class Archive:
                     account["needs_full_scan"] = True
                 if status == "interrupted":
                     account["resume"] = dict(full=full, done=list(self.job["done_phases"]), paused=False,
-                                             watch=False, trigger=None, started_at=None, downloaded=0)
+                                             trigger=None, started_at=None, downloaded=0)
                     account["next_due"] = time.time()
                 else:
                     account["resume"] = None
                     account["crashes"] = 0
-                    from_watch = self.job["trigger"] == "watch"
-                    if not from_watch:
-                        # A quick check started by real-time detection leaves the regular schedule alone.
-                        self.schedule_next(account)
+                    self.schedule_next(account)
                     if status in ("success", "partial"):
                         account["last_success"] = time.time()
-                        account["last_checked"] = time.time()
-                        if status == "success" or not from_watch:
-                            account.update(watch_failures=0, watch_suspended=False, watch_note=None)
                         if full:
                             account["last_full_scan"] = time.time()
                             account["needs_full_scan"] = False
-                    # Something the probe keeps finding but cannot archive must not
-                    # start a quick check (and a notification) every few minutes.
-                    self.schedule_watch(account, failed=from_watch and status in ("error", "partial"))
                 self._finish_record(account, status, message)
-            self.set_job(status, message, watch=False)
+            self.set_job(status, message)
             self.log("info", message)
             self.try_persist()
             unattended = not self.attended()
@@ -966,51 +866,20 @@ class Archive:
             self.notify(status, f"{notifier.APP_TITLE}：{title}",
                         f"{notifier.mask_account(config['account'])}：{title}。{summary}")
 
-    def _record_pause(self, account, full, probe):
+    def _record_pause(self, account, full):
         until = time.time() + self.pause_minutes * 60 if self.pause_minutes else None
-        account["resume"] = dict(full=full, done=list(self.job["done_phases"]), paused=True, watch=probe,
+        account["resume"] = dict(full=full, done=list(self.job["done_phases"]), paused=True,
                                  trigger=self.job.get("trigger"), started_at=self.job.get("started_at"),
                                  downloaded=self.media_count)
         message = ("已暂停，将在设定时间自动继续。" if until else "已暂停，点击「继续」后接着下载。")
-        self.set_job("paused", message, watch=False, pause_until=timestamp(until) if until else None, pause_due=until)
+        self.set_job("paused", message, pause_until=timestamp(until) if until else None, pause_due=until)
         self.log("info", message)
-
-    def _finish_probe(self, account, status, message, outcome):
-        """A real-time probe that found nothing new leaves no trace but the account's check time."""
-        restored = self.previous_job or dict(IDLE_JOB)
-        self.job = restored
-        self.previous_job = None
-        if account is None:
-            return
-        if status in ("success", "partial") and getattr(outcome, "probe_only", False) is True:
-            account.update(last_checked=time.time(), watch_failures=0, watch_note=None)
-            self.schedule_watch(account)
-        elif status == "interrupted":
-            account["watch_due"] = time.time()
-        elif status == "cancelled":
-            self.schedule_watch(account)
-        else:
-            if self.prompted:
-                # Apple wants a password or code nobody entered. Do not ask again every few
-                # minutes: the next manual or scheduled run re-establishes the session.
-                account["watch_suspended"] = True
-                account["watch_note"] = "实时检测已暂停：需要重新验证 Apple 账户。下次手动或定时下载完成验证后自动恢复。"
-            else:
-                self.schedule_watch(account, failed=True)
-                account["watch_note"] = f"实时检测未能完成，稍后自动重试。{message}"
-            self.log("warning", f"实时检测 {account['account']}：{message}")
-        self.try_persist()
 
     def _record_start_failure(self, account, trigger, message):
         with self.lock:
             account_id = account["id"]
             if (self.find(account_id) is not account or self.job["status"] in HELD
                     or not self._still_due(account, trigger)):
-                return
-            if trigger == "watch":
-                self.schedule_watch(account, failed=True)
-                account["watch_note"] = f"实时检测未能开始，稍后自动重试。{message}"
-                self.try_persist()
                 return
             account["resume"] = None
             account["needs_full_scan"] = True
@@ -1042,23 +911,18 @@ class Archive:
         """The earliest due run, honouring a short grace period after start-up.
 
         A paused job holds the slot: only its own timed continuation can start.
-        Scheduled runs come before a real-time probe that is due at the same time.
         """
         earliest = self.started + self.startup_grace
         if self.job["status"] == "paused":
             account = self.find(self.job.get("account_id"))
             due = self.job.get("pause_due")
             return (max(due, earliest), account, "continue") if account and due is not None else None
-        due = []
-        for index, item in enumerate(self.accounts):
-            if item["next_due"] is not None:
-                due.append((max(item["next_due"], earliest), 0, index, item, "resume" if item["resume"] else "schedule"))
-            if self._watching(item):
-                due.append((max(item["watch_due"], earliest), 1, index, item, "watch"))
-        if not due:
+        scheduled = (item for item in self.accounts if item["next_due"] is not None)
+        account = min(scheduled, key=lambda item: item["next_due"], default=None)
+        if account is None:
             return None
-        when, _, _, account, trigger = min(due, key=lambda entry: entry[:3])
-        return when, account, trigger
+        trigger = "resume" if account["resume"] else "schedule"
+        return max(account["next_due"], earliest), account, trigger
 
     def schedule_loop(self):
         while True:

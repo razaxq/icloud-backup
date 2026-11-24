@@ -85,7 +85,9 @@ class ServiceTests(ServiceCase):
         self.assertTrue(job["full_scan"])
         self.assertEqual((self.dest / "2026/01/test-0.MOV").read_bytes(), b"fixture-MOV")
         self.assertEqual(self.call("/api/start", {"id": account_id})[0], 200)
-        self.assertIn("0 个", self.wait_job("success")["message"])
+        job = self.wait_job("success")
+        self.assertIn("0 个", job["message"])
+        self.assertFalse(job["full_scan"])
         state = self.state()
         self.assertEqual([item["status"] for item in state["history"]], ["success", "success"])
         self.assertIsNotNone(state["accounts"][0]["last_success"])
@@ -125,7 +127,7 @@ class ServiceTests(ServiceCase):
         self.assertEqual(job["trigger"], "schedule")
         self.assertTrue(job["full_scan"], "no full scan recorded yet")
         state = self.state()
-        self.assertEqual(state["accounts"][0]["interval_hours"], 24)
+        self.assertEqual(state["accounts"][0]["interval_minutes"], 1440)
         self.assertIsNotNone(state["accounts"][0]["next_run"])
         self.assertEqual(json.loads((self.state_dir / "archive.json").read_text())["version"], archive_module.STATE_VERSION)
 
@@ -387,8 +389,59 @@ class ArchiveConsistencyTests(unittest.TestCase):
             self.assertEqual(record["status"], "unverified")
             self.assertIn("old", record["message"])
         saved = json.loads(archive.file.read_text())
-        self.assertEqual(saved["version"], 2, "0.2.x can read the same envelope if the user rolls back")
+        self.assertEqual(saved["version"], archive_module.STATE_VERSION)
         self.assertEqual(saved["verification_version"], archive_module.VERIFICATION_VERSION)
+
+    def test_060_schedules_merge_once_preserving_pending_runs_and_baselines(self):
+        now = time.time()
+        next_due, watch_due = now + 3600, now + 100
+        paused = dict(full=False, done=["PrimarySync"], paused=True, trigger="watch", downloaded=7)
+        variants = [
+            (dict(interval_hours=0), 0, None),
+            (dict(interval_hours=6, next_due=next_due), 360, next_due),
+            (dict(interval_hours=0, watch=True, watch_due=watch_due), 15, watch_due),
+            (dict(interval_hours=24, next_due=next_due, watch=True, watch_due=watch_due), 15, watch_due),
+            (dict(interval_hours=0, watch=True, watch_suspended=True, watch_due=watch_due), 15, None),
+            (dict(interval_hours=1, watch=True, watch_due=watch_due, resume=paused), 15, None),
+            (dict(interval_hours=0, next_due=next_due, resume={"full": True}), 0, next_due),
+        ]
+        rows = [dict(self.payload, id=str(i), last_full_scan=now) | changes
+                for i, (changes, _, _) in enumerate(variants)]
+        path = self.state_dir / "archive.json"
+        path.write_text(json.dumps(dict(version=2, verification_version=2, accounts=rows,
+                                        settings={"watch_minutes": 15}, job={"status": "paused", "account_id": "5",
+                                                                             "trigger": "watch"})))
+        for _ in range(2):
+            app = self.archive()
+            for account, (_, minutes, due) in zip(app.accounts, variants, strict=True):
+                self.assertEqual((account["interval_minutes"], account["next_due"]), (minutes, due))
+                self.assertEqual(account["last_full_scan"], now)
+                self.assertNotIn("watch_due", account)
+            self.assertEqual(app.job["status"], "paused")
+            self.assertEqual(app.find("5")["resume"], dict(paused, trigger="schedule", started_at=None))
+            self.assertIsNone(app._next_due())
+            app.close()
+
+    def test_short_cadence_and_full_scan_rules(self):
+        app = self.archive()
+        with mock.patch.object(archive_module.time, "time", return_value=1000000):
+            payload = dict(self.payload, interval_minutes=5)
+            account = app.find(app.save_account(payload))
+            self.assertEqual(account["next_due"], 1000300)
+            for trigger in ("manual", "schedule"):
+                self.assertTrue(app._wants_full_scan(account, trigger, None))
+                account["last_full_scan"] = 999999
+                self.assertFalse(app._wants_full_scan(account, trigger, None))
+                account["last_full_scan"] = 1000000 - archive_module.FULL_SCAN_EVERY
+                self.assertTrue(app._wants_full_scan(account, trigger, None))
+                account["last_full_scan"] = 999999
+                account["cleanup"]["mode"] = "days"
+                self.assertTrue(app._wants_full_scan(account, trigger, None))
+                account["cleanup"]["mode"] = "off"
+                account["last_full_scan"] = None
+        for invalid in (1, 5.5, True, "5", None):
+            with self.subTest(invalid=invalid), self.assertRaises(archive_module.RequestError):
+                app.save_account(dict(payload, interval_minutes=invalid))
 
     def test_050_upgrade_resets_deletion_and_paused_checkpoints(self):
         old = dict(self.payload, id="account1", cleanup={"mode":"immediate","value":0,"shared":True},
@@ -418,7 +471,7 @@ class ArchiveConsistencyTests(unittest.TestCase):
         archive.media_count = 3
         archive.job.update(account_id=account["id"], trigger="manual", done_phases=["PrimarySync"])
         archive.pause_minutes = 30
-        archive._record_pause(account, full=True, probe=False)
+        archive._record_pause(account, full=True)
         archive.persist()
         saved = json.loads(archive.file.read_text())
         for action, error in [(archive.stop, OSError), (archive.resume_paused, archive_module.RequestError)]:

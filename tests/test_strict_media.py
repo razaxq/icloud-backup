@@ -103,7 +103,7 @@ class AssetIntegrityTests(unittest.TestCase):
         self.photo.versions[size] = resource(contents, uti)
         self.payloads[size] = contents
 
-    def archive_one(self):
+    def archive_one(self, counter=None):
         from icloudpd import base
         from icloudpd.counter import Counter
         from pyicloud_ipd.file_match import FileMatchPolicy
@@ -117,7 +117,7 @@ class AssetIntegrityTests(unittest.TestCase):
                                 [self.Asset.ORIGINAL, self.Asset.ALTERNATIVE, self.Asset.ADJUSTED], False,
                                 False, False, False, self.Live.ORIGINAL, False, FileMatchPolicy.NAME_ID7,
                                 True, base.lp_filename_original, lambda _: "IMG_1234567.HEIC", RawTreatmentPolicy.AS_IS,
-                                self.client, Counter(), self.photo)
+                                self.client, Counter() if counter is None else counter, self.photo)
 
     def issues(self):
         return [json.loads(line[len(strict_cli.PROTOCOL):])[0] for line in self.log.getvalue().splitlines()]
@@ -156,101 +156,17 @@ class AssetIntegrityTests(unittest.TestCase):
         self.assertEqual(self.issues(), ["mismatch"])
         self.assertFalse(list(self.folder.rglob("*.HEIC")))
 
-
-@unittest.skipUnless(importlib.util.find_spec("icloudpd"), "requires packaged icloudpd 1.33.0")
-class RealTimeProbeTests(unittest.TestCase):
-    """--only-print-filenames: report what is missing using file metadata only."""
-
-    setUp = AssetIntegrityTests.setUp
-    provide = AssetIntegrityTests.provide
-    archive_one = AssetIntegrityTests.archive_one
-
-    def probe_one(self):
-        from icloudpd import base
+    def test_quick_check_counts_only_complete_previously_archived_assets(self):
         from icloudpd.counter import Counter
-        from pyicloud_ipd.file_match import FileMatchPolicy
-        from pyicloud_ipd.raw_policy import RawTreatmentPolicy
-        self.log = io.StringIO()
-        no_reads = patch.object(Path, "open", side_effect=AssertionError("a probe must not read photo bodies"))
-        no_downloads = patch("icloudpd.download.download_media", side_effect=AssertionError("probe downloaded"))
-        with redirect_stdout(self.log), no_reads, no_downloads:
-            return strict_cli.ProbeArchive()(
-                logging.getLogger("probe-test"), "{:%Y/%m}", str(self.folder),
-                [self.Asset.ORIGINAL, self.Asset.ALTERNATIVE, self.Asset.ADJUSTED], False,
-                True, False, False, self.Live.ORIGINAL, False, FileMatchPolicy.NAME_ID7,
-                True, base.lp_filename_original, lambda _: "IMG_1234567.HEIC", RawTreatmentPolicy.AS_IS,
-                self.client, Counter(), self.photo)
 
-    def test_missing_files_are_reported_without_downloading_or_reading(self):
-        self.provide(self.Asset.ORIGINAL, b"full still", "public.heic")
-        self.provide(self.Live.ORIGINAL, b"full movie", "com.apple.quicktime-movie")
-        self.assertFalse(self.probe_one().present)
-        self.assertEqual(self.log.getvalue(), strict_cli.PROTOCOL + "pending\n")
-        self.assertFalse((self.folder / "2020").exists(), "a probe creates nothing")
-
-        self.assertTrue(self.archive_one().present)
-        self.assertTrue(self.probe_one().present)
-        self.assertEqual(self.log.getvalue(), "")
-        next(self.folder.rglob("IMG_1234567.MOV")).unlink()  # a missing Live Photo movie counts too
-        self.assertFalse(self.probe_one().present)
-        self.assertIn("pending", self.log.getvalue())
-
-    def test_size_change_is_reported(self):
-        self.provide(self.Asset.ORIGINAL, b"full still", "public.heic")
-        self.archive_one()
-        next(self.folder.rglob("IMG_1234567.HEIC")).write_bytes(b"short")
-        self.assertFalse(self.probe_one().present)
-
-    def test_existing_preview_does_not_satisfy_a_missing_live_original(self):
-        self.provide(self.Asset.ORIGINAL, b"full still", "public.heic")
-        self.provide(self.Live.MEDIUM, b"small movie", "com.apple.quicktime-movie")
-        self.assertFalse(self.archive_one().present)
-        self.assertFalse(self.probe_one().present)
-        self.assertEqual(self.log.getvalue(), strict_cli.PROTOCOL + "pending\n")
-
-    def test_missing_or_empty_sidecar_triggers_repair(self):
-        self.provide(self.Asset.ORIGINAL, b"full still", "public.heic")
-        self.assertTrue(self.archive_one().present)
-        sidecar, = self.folder.rglob("*.xmp")
-        sidecar.unlink()
-        self.assertFalse(self.probe_one().present)
-        sidecar.touch()
-        self.assertFalse(self.probe_one().present)
-        self.assertTrue(self.archive_one().present)
-        self.assertTrue(self.probe_one().present)
-
-    def test_modes_cannot_be_mixed(self):
-        self.provide(self.Asset.ORIGINAL, b"full still", "public.heic")
-        from icloudpd import base
-        from icloudpd.counter import Counter
-        from pyicloud_ipd.file_match import FileMatchPolicy
-        from pyicloud_ipd.raw_policy import RawTreatmentPolicy
-        args = (logging.getLogger("t"), "{:%Y/%m}", str(self.folder),
-                [self.Asset.ORIGINAL, self.Asset.ALTERNATIVE, self.Asset.ADJUSTED], False)
-        rest = (False, False, self.Live.ORIGINAL, False, FileMatchPolicy.NAME_ID7, True, base.lp_filename_original,
-                lambda _: "IMG_1234567.HEIC", RawTreatmentPolicy.AS_IS, None, Counter(), self.photo)
-        with self.assertRaisesRegex(RuntimeError, "Unexpected"):
-            strict_cli.ProbeArchive()(*args, False, *rest)
-        with self.assertRaisesRegex(RuntimeError, "Unexpected"):
-            strict_cli.StrictArchive()(*args, True, *rest)
-
-    def test_pinned_cli_accepts_the_probe_arguments(self):
-        from worker.engine import MEDIA_OPTIONS, WATCH_RECENT
-        seen = {}
-
-        def capture(global_ns, user_nses):
-            from icloudpd import base
-            seen.update(builder=type(base.download_builder), only=global_ns.only_print_filenames,
-                        recent=user_nses[0].recent, library=user_nses[0].library)
-            return 0
-
-        argv = ["icloudpd", "--no-progress-bar", "--log-level", "info", "--domain", "com",
-                "--password-provider", "console", "--mfa-provider", "console", "--username", "a@example.com",
-                "--cookie-directory", str(self.folder), "--library", "PrimarySync", "--directory", str(self.folder),
-                *MEDIA_OPTIONS, "--recent", str(WATCH_RECENT), "--only-print-filenames"]
-        with patch.object(sys, "argv", argv), patch("icloudpd.cli.run_with_configs", side_effect=capture), \
-                redirect_stdout(io.StringIO()) as out:
-            self.assertEqual(strict_cli.main(), 0)
-        self.assertEqual(seen, dict(builder=strict_cli.ProbeArchive, only=True, recent=WATCH_RECENT,
-                                    library="PrimarySync"))
-        self.assertIn(strict_cli.PROTOCOL + "checked", out.getvalue())
+        counter = Counter()
+        self.provide(self.Asset.ORIGINAL, b"still", "public.heic")
+        self.provide(self.Live.ORIGINAL, b"movie", "com.apple.quicktime-movie")
+        self.assertTrue(self.archive_one(counter).present)
+        self.assertEqual(counter.value(), 0)
+        self.assertTrue(self.archive_one(counter).present)
+        self.assertEqual(counter.value(), 1)
+        del self.photo.versions[self.Live.ORIGINAL]
+        self.photo._asset_record["fields"]["assetSubtypeV2"] = {"value": 2}
+        self.assertFalse(self.archive_one(counter).present)
+        self.assertEqual(counter.value(), 0)

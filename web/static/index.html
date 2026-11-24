@@ -28,7 +28,6 @@
     <symbol id="i-back" viewBox="0 0 24 24"><path d="M19 12H5m6-6-6 6 6 6"/></symbol>
     <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 8v4.5M12 16h.01"/></symbol>
     <symbol id="i-pause" viewBox="0 0 24 24"><path d="M9 5.5v13M15 5.5v13"/></symbol>
-    <symbol id="i-radar" viewBox="0 0 24 24"><circle cx="12" cy="12" r="2"/><path d="M7.8 16.2a6 6 0 0 1 0-8.4m8.4 0a6 6 0 0 1 0 8.4M5 19a10 10 0 0 1 0-14m14 0a10 10 0 0 1 0 14"/></symbol>
     <symbol id="i-gear" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2.8v2.4m0 13.6v2.4M5.5 5.5l1.7 1.7m9.6 9.6 1.7 1.7M2.8 12h2.4m13.6 0h2.4M5.5 18.5l1.7-1.7m9.6-9.6 1.7-1.7"/></symbol>
     <symbol id="i-lock" viewBox="0 0 24 24"><rect x="5" y="10.5" width="14" height="10" rx="2.5"/><path d="M8.5 10.5V8a3.5 3.5 0 0 1 7 0v2.5"/></symbol>
   </svg>
@@ -173,28 +172,22 @@
 
               <fieldset class="section">
                 <div class="section-head">
-                  <legend>自动下载</legend>
-                  <p class="hint">手动开始的下载始终完整扫描。暂停或服务中断后，任务从未完成的图库接着下载。</p>
+                  <legend>备份安排</legend>
+                  <p class="hint">平时从最新照片开始快速检查。首次备份、失败后重试、距离上次完整扫描满 7 天，或启用保留策略预览时，会完整扫描。</p>
                 </div>
                 <div class="section-body">
                   <div class="field">
-                    <label for="interval">运行频率</label>
+                    <label for="interval">自动备份频率</label>
                     <select id="interval">
-                      <option value="0">关闭，仅手动下载</option><option value="1">每 1 小时</option><option value="6">每 6 小时</option><option value="12">每 12 小时</option><option value="24">每 24 小时</option><option value="168">每 7 天</option>
+                      <option value="0">仅手动备份</option>
+                      <option value="5">每 5 分钟</option><option value="10">每 10 分钟</option>
+                      <option value="15">每 15 分钟</option><option value="30">每 30 分钟</option>
+                      <option value="60" selected>每小时</option><option value="360">每 6 小时</option>
+                      <option value="720">每 12 小时</option><option value="1440">每天</option>
+                      <option value="10080">每 7 天</option>
                     </select>
                   </div>
-                  <div class="field" id="scan-options">
-                    <span class="field-label" id="scan-label">定时任务的扫描方式</span>
-                    <div class="choices" role="radiogroup" aria-labelledby="scan-label">
-                      <label class="choice"><input type="radio" name="scan" value="auto" checked><span><strong>快速检查 <em>推荐</em></strong><span class="hint">从最新项目开始，遇到连续已归档的项目即结束。每 7 天完整扫描一次。</span></span></label>
-                      <label class="choice"><input type="radio" name="scan" value="full"><span><strong>每次完整扫描</strong><span class="hint">每次核对全部原件，大图库耗时较长。</span></span></label>
-                    </div>
-                  </div>
                   <label class="check"><input type="checkbox" id="include-shared" checked> 同时下载 iCloud 共享照片图库</label>
-                  <div class="toggle-block">
-                    <label class="check"><input type="checkbox" id="watch" aria-describedby="watch-hint"> 实时检测新照片</label>
-                    <p class="hint" id="watch-hint"></p>
-                  </div>
                 </div>
               </fieldset>
 
@@ -227,7 +220,7 @@
                 <button type="button" class="btn text" id="editor-close">取消</button>
                 <span class="spacer"></span>
                 <button type="submit" class="btn ghost" id="save-account">仅保存</button>
-                <button type="button" class="btn primary" id="save-start"><svg class="icon" aria-hidden="true"><use href="#i-play"/></svg>保存并开始下载</button>
+                <button type="button" class="btn primary" id="save-start"><svg class="icon" aria-hidden="true"><use href="#i-play"/></svg>保存并立即备份</button>
               </div>
             </fieldset>
           </form>
@@ -277,7 +270,6 @@
       <div class="settings-layout">
         <nav class="settings-nav" aria-label="设置分类">
           <a href="#settings/notify" data-section="notify"><svg class="icon" aria-hidden="true"><use href="#i-bell"/></svg>通知</a>
-          <a href="#settings/watch" data-section="watch"><svg class="icon" aria-hidden="true"><use href="#i-radar"/></svg>实时检测</a>
           <a href="#settings/about" data-section="about"><svg class="icon" aria-hidden="true"><use href="#i-info"/></svg>关于</a>
         </nav>
 
@@ -348,34 +340,6 @@
                     </div>
                   </fieldset>
                 </form>
-          </div>
-        </section>
-
-        <section class="panel settings-panel" data-section="watch" aria-labelledby="watch-heading" hidden>
-          <div class="panel-head">
-            <div><h2 id="watch-heading">实时检测</h2><p class="hint">Apple 没有向第三方应用开放 iCloud 照片的变更推送，应用通过频繁、轻量的检测接近实时。</p></div>
-          </div>
-          <div class="settings-body">
-            <form id="watch-form" novalidate>
-              <fieldset id="watch-fields">
-                <div class="field">
-                  <span class="field-label" id="watch-interval-label">检测间隔</span>
-                  <div class="segmented" role="radiogroup" aria-labelledby="watch-interval-label" id="watch-interval"></div>
-                </div>
-                <ul class="plain-list" id="watch-facts">
-                  <li id="watch-fact-recent"></li>
-                  <li>检测只比对文件是否存在及大小，不读取照片内容。没有新照片时不会写入运行记录和任务历史。</li>
-                  <li>拍摄时间较早的导入照片排在图库后面，会在下次定时扫描或每周完整扫描时补齐。</li>
-                  <li>检测失败时自动延长间隔。Apple 要求重新验证时暂停检测，下次手动或定时下载完成验证后自动恢复。</li>
-                </ul>
-                <p class="callout"><svg class="icon" aria-hidden="true"><use href="#i-info"/></svg><span id="watch-accounts"></span></p>
-                <div class="form-footer">
-                  <span id="watch-status" class="hint" role="status"></span>
-                  <span class="spacer"></span>
-                  <button type="submit" class="btn primary" id="watch-save">保存</button>
-                </div>
-              </fieldset>
-            </form>
           </div>
         </section>
 

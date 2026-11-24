@@ -161,8 +161,6 @@ class Handler(BaseHTTPRequestHandler):
                 archive.pause(data)
             elif path == "/api/resume":
                 archive.resume_paused()
-            elif path == "/api/settings/save":
-                archive.save_settings(data)
             elif path == "/api/input":
                 archive.submit(data)
             elif path == "/api/notify/save":

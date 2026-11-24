@@ -249,48 +249,6 @@ def present(path, size=None):
     return stat.S_ISREG(info.st_mode) and info.st_size > 0 and (size is None or info.st_size == size)
 
 
-class ProbeArchive:
-    """--only-print-filenames: report newest assets whose files are not on disk yet.
-
-    Nothing is downloaded or written. The worker starts a strict quick check
-    when anything is reported, and that run verifies every byte as usual.
-    """
-
-    def __init__(self, zone="PrimarySync"):
-        self.failed = False
-        self.zone = zone
-
-    def __call__(self, logger, folder_structure, directory, primary_sizes, force_size,
-                 only_print_filenames, set_exif_datetime, skip_live_photos, live_photo_size,
-                 dry_run, file_match_policy, xmp_sidecar, lp_filename_generator,
-                 filename_builder, raw_policy, icloud, counter, photo):
-        from icloudpd import base
-        from tzlocal import get_localzone
-
-        check_options(folder_structure, primary_sizes, force_size, set_exif_datetime, skip_live_photos,
-                      live_photo_size, dry_run, file_match_policy, raw_policy)
-        if not only_print_filenames:
-            raise RuntimeError("Unexpected probe options")
-        try:
-            name = filename_builder(photo)
-            created = photo.created.astimezone(get_localzone())
-            folder = Path(directory).joinpath(*Path(folder_structure.format(created)).parts)
-            files, missing = renditions(photo, name, primary_sizes, lp_filename_generator)
-            folder = catalog.layout(folder, catalog.identity(icloud, self.zone, photo), catalog.revision(photo))
-            complete = not missing and present(folder / "manifest.json") and present(folder / ".identity.json")
-            for _, version, filename, needs_sidecar in files:
-                signature(version)
-                if (not present(folder / filename, version.size)
-                        or (xmp_sidecar and needs_sidecar and not present(folder / (filename + ".xmp")))):
-                    complete = False
-                    break
-        except (IntegrityError, KeyError, IndexError, OSError, TypeError, ValueError, OverflowError):
-            complete = False  # let the strict run inspect and report it
-        if not complete:
-            print(PROTOCOL + "pending", flush=True)
-        return base.DownloadResult(downloaded=False, present=complete)
-
-
 class StrictArchive:
     """The pinned CLI supplies its resolved naming policy, session, counter and asset."""
 
@@ -430,7 +388,7 @@ def main():
             status = run_cli(StrictArchive(db, zone))
             db.commit()  # Incomplete items also belong in migration reports.
             return status
-    return run_cli(ProbeArchive(zone) if "--only-print-filenames" in args else StrictArchive(zone=zone))
+    return run_cli(StrictArchive(zone=zone))
 
 
 def run_cli(archive):

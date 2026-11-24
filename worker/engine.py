@@ -43,11 +43,6 @@ MEDIA_OPTIONS = (
 # asset including its original Live Photo companion.
 INCREMENTAL_UNTIL_FOUND = 100
 
-# Real-time detection looks only at the newest assets by capture date, reading
-# file metadata (no hashing) so that a frequent probe lets the NAS disks sleep.
-# Anything missing starts a normal strict quick check.
-WATCH_RECENT = 10
-
 INTEGRITY_REASONS = {
     "inventory": "图库清单不一致，已停止 iCloud 清理",
     "raw": "缺少 RAW 或替代原件",
@@ -88,10 +83,7 @@ class SyncResult:
     full_scan: bool = True
     warnings: list = field(default_factory=list)  # finished with caveats
     failures: list = field(default_factory=list)  # a library could not be completed
-    libraries: list = None  # shared libraries found by this run's listing
-    pending: int = 0  # newest assets a real-time probe found missing locally
     review: str = ""
-    probe_only: bool = False  # a real-time probe found nothing new and stopped
 
     @staticmethod
     def note(bucket, text):
@@ -109,7 +101,6 @@ class _Run:
     reason: str = ""  # fatal for the whole job: login, region or web-access problems
     denied: bool = False
     checked: bool = False
-    pending: int = 0
     missing_hidden_album: bool = False
     issues: dict = field(default_factory=dict)
 
@@ -120,9 +111,6 @@ class _Run:
             marker = line[len(PROTOCOL):]
             if marker == "checked":
                 self.checked = True
-                return
-            if marker == "pending":
-                self.pending += 1
                 return
             if marker == "removed":
                 on_event("removed", "iCloud 已确认删除一个已备份项目。")
@@ -327,7 +315,7 @@ def _short_library(name):
 
 def run_sync(*, binary, username, domain, destination, session_dir,
              prompt, on_event, cancel, include_shared=True, full_scan=True,
-             watch=False, known_libraries=(), skip_phases=frozenset(), on_phase=None, cleanup=None):
+             skip_phases=frozenset(), on_phase=None, cleanup=None):
     """Archive one account and return a SyncResult.
 
     Raises SyncError only when the whole job cannot continue (login, region,
@@ -336,10 +324,7 @@ def run_sync(*, binary, username, domain, destination, session_dir,
     blocking prompt(kind, message). All on_event(kind, message) text and every
     message in the result are suitable for display.
 
-    watch=True first probes the newest assets of PrimarySync and the
-    known_libraries. If nothing is missing it returns with probe_only set and
-    no log output; otherwise it reports on_event("begin", ...) and continues
-    as a quick check. Library phases named in skip_phases ("<library>" and
+    Library phases named in skip_phases ("<library>" and
     "<library>/Hidden") were completed by an earlier, paused or interrupted
     attempt and are skipped; on_phase(name) reports each phase completed now.
     """
@@ -364,8 +349,6 @@ def run_sync(*, binary, username, domain, destination, session_dir,
     preview = rule["mode"] != "off"
     if preview:
         full_scan = True
-    elif watch:
-        full_scan = False
     scan = [] if full_scan else ["--until-found", str(INCREMENTAL_UNTIL_FOUND)]
     outcome = SyncResult(full_scan=full_scan)
     use_adp = False
@@ -380,14 +363,13 @@ def run_sync(*, binary, username, domain, destination, session_dir,
         resumed = False
         done = set()
 
-        def run(options, label, listing=False, optional_hidden=False, phase=None, probe=False, prefix=()):
+        def run(options, label, listing=False, optional_hidden=False, phase=None, prefix=()):
             """Run one phase; return its _Run, or None when it failed or was skipped."""
             nonlocal use_adp
             if phase in skip_phases and (not prefix or resumed):
                 on_event("info", f"{label}已在上次完成，跳过。")
                 return None
-            if not probe:
-                on_event("info", f"正在{'查找' if listing else '扫描'}{label}。")
+            on_event("info", f"正在{'查找' if listing else '扫描'}{label}。")
 
             def invoke():
                 extra = ["--adp-web-access"] if use_adp else []
@@ -409,11 +391,10 @@ def run_sync(*, binary, username, domain, destination, session_dir,
             if optional_hidden and result.missing_hidden_album and not issues:
                 outcome.note(outcome.warnings, f"{label}未能完成：该共享图库未提供隐藏相簿。")
                 return None
-            if code or issues or not result.checked or (not listing and not probe and not result.finished):
+            if code or issues or not result.checked or (not listing and not result.finished):
                 detail = "；".join(issues) if issues else ("下载器异常退出。" if code else "未收到原件校验完成的确认。")
                 outcome.note(outcome.failures, f"{label}未能完成：{detail}")
-                if not probe:
-                    on_event("warning", f"{label}未能完成，继续处理其他图库。")
+                on_event("warning", f"{label}未能完成，继续处理其他图库。")
                 return None
             if phase:
                 done.add(phase)
@@ -435,27 +416,6 @@ def run_sync(*, binary, username, domain, destination, session_dir,
             run(args + ["--album", "Hidden"], f"{label}的隐藏项目", optional_hidden=shared,
                 phase=name + "/Hidden", prefix=record)
 
-        if watch:
-            libraries = [("PrimarySync", target, "个人图库")]
-            if include_shared:
-                libraries += [(name, target / "共享图库" / name, f"共享图库（{_short_library(name)}）")
-                              for name in known_libraries if _SHARED.fullmatch(name)]
-            for name, folder, label in libraries:
-                # A library never archived before is left to the scheduled runs.
-                if not folder.is_dir() or folder.resolve() != folder:
-                    continue
-                probe = run(["--library", name, "--directory", str(folder), *MEDIA_OPTIONS,
-                             "--recent", str(WATCH_RECENT), "--only-print-filenames"], label, probe=True)
-                if probe is not None:
-                    outcome.pending += probe.pending
-            if outcome.failures:
-                return outcome
-            if not outcome.pending:
-                outcome.probe_only = True
-                return outcome
-            scan_name = "完整扫描" if full_scan else "快速检查"
-            on_event("begin", f"发现 {outcome.pending} 个待核对项目，开始{scan_name}。")
-
         if audit:
             resumed = not preview and retention.resume_inventory(checkpoint, inventory, target, include_shared, skip_phases)
             if resumed:
@@ -467,7 +427,6 @@ def run_sync(*, binary, username, domain, destination, session_dir,
         if include_shared:
             listed = run(["--list-libraries"], "共享图库", listing=True)
             if listed is not None:
-                outcome.libraries = sorted(listed.libraries - {"PrimarySync"})
                 if "PrimarySync" not in listed.libraries:
                     outcome.note(outcome.failures, "未能确认账户的图库列表是否完整。")
                 for library in sorted(listed.libraries - {"PrimarySync"}):

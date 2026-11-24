@@ -159,12 +159,6 @@ class RunSyncTests(unittest.TestCase):
         self.assertTrue((self.dest / "2026/01/hidden-0.HEIC").exists())
         self.assertFalse(any("--until-found" in call for call in self.calls()))
 
-    def test_listing_reports_shared_libraries_for_the_probe(self):
-        result, _ = self.run_sync({"libraries": ["SharedSync-ABC"]})
-        self.assertEqual(result.libraries, ["SharedSync-ABC"])
-        result, _ = self.run_sync(include_shared=False)
-        self.assertIsNone(result.libraries)
-
     def test_completed_phases_are_skipped_and_reported(self):
         done = []
         result, events = self.run_sync({"libraries": ["SharedSync-ABC"]},
@@ -181,41 +175,6 @@ class RunSyncTests(unittest.TestCase):
         done = []
         self.run_sync({"fail_primary": True}, include_shared=False, on_phase=done.append)
         self.assertEqual(done, ["PrimarySync/Hidden"])
-
-    def test_probe_with_nothing_new_is_silent_and_writes_nothing(self):
-        self.run_sync({"libraries": ["SharedSync-ABC"]})  # baseline archive
-        self.calls_file.unlink()
-        result, events = self.run_sync({"libraries": ["SharedSync-ABC"]}, watch=True,
-                                       known_libraries=["SharedSync-ABC", "../escape", "PrimarySync"])
-        self.assertTrue(result.probe_only)
-        self.assertEqual((result.pending, result.downloaded, result.failures, events), (0, 0, [], []))
-        calls = self.calls()
-        self.assertEqual([call[call.index("--library") + 1] for call in calls], ["PrimarySync", "SharedSync-ABC"])
-        for call in calls:
-            self.assertIn("--only-print-filenames", call)
-            self.assertEqual(call[call.index("--recent") + 1], str(engine.WATCH_RECENT))
-            self.assertNotIn("--album", call)
-
-    def test_probe_finding_new_items_runs_a_quick_check(self):
-        self.run_sync({"files": 1}, include_shared=False)
-        self.calls_file.unlink()
-        result, events = self.run_sync({"files": 2}, watch=True, include_shared=False)
-        self.assertFalse(result.probe_only)
-        self.assertEqual(result.pending, 1)
-        self.assertEqual(events[0], ("begin", "发现 1 个待核对项目，开始快速检查。"))
-        self.assertTrue((self.dest / "2026/01/test-1.MOV").exists())
-        quick = [call for call in self.calls() if "--only-print-filenames" not in call]
-        self.assertTrue(quick and all("--until-found" in call for call in quick))
-        self.assertFalse(result.full_scan)
-
-    def test_probe_skips_libraries_never_archived_and_reports_failures(self):
-        self.run_sync(watch=True, include_shared=True, known_libraries=["SharedSync-NEW"])
-        probes = [call[call.index("--library") + 1] for call in self.calls() if "--only-print-filenames" in call]
-        self.assertEqual(probes, ["PrimarySync"], "a shared library never archived is left to scheduled runs")
-        result, events = self.run_sync({"probe_fail": True}, watch=True)
-        self.assertFalse(result.probe_only)
-        self.assertTrue(result.failures)
-        self.assertFalse(any(kind == "begin" for kind, _ in events))
 
     def test_incremental_scan_uses_until_found(self):
         result, _ = self.run_sync(full_scan=False, include_shared=False)
@@ -238,15 +197,10 @@ class RunSyncTests(unittest.TestCase):
         self.assertFalse(any(kind == "removed" for kind, _ in events))
         self.assertIn("预览", result.review)
 
-    def test_incomplete_backup_and_quiet_probe_cannot_apply_cleanup(self):
+    def test_incomplete_backup_cannot_apply_cleanup(self):
         rule = {"mode": "immediate"}
         result, _ = self.run_sync({"missing_live": True}, cleanup=rule)
         self.assertTrue(result.failures)
-        self.assertFalse(any("--fn-cleanup-apply" in call for call in self.calls()))
-        self.run_sync()
-        self.calls_file.unlink()
-        result, _ = self.run_sync(watch=True, cleanup=rule)
-        self.assertTrue(result.probe_only)
         self.assertFalse(any("--fn-cleanup-apply" in call for call in self.calls()))
 
     def test_failed_library_does_not_stop_others(self):
