@@ -1,0 +1,54 @@
+name: 构建飞牛安装包
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: 构建并验证 AMD64 和 ARM64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 构建并校验两个架构的 FPK
+        run: python3.12 -B build.py --arch both
+
+      - name: 使用 AMD64 安装包中的依赖运行离线测试
+        shell: bash
+        run: |
+          set -euo pipefail
+          app="$RUNNER_TEMP/icloud-photos-app"
+          mkdir -p "$app"
+          tar -xOf dist/*-amd64.fpk app.tgz | tar -xz -C "$app"
+          export PYTHONPATH="$app/vendor"
+          python3.12 -B -c 'import icloudpd, pyicloud_ipd'
+          python3.12 -B -m unittest discover -s tests -v
+
+      - name: 生成安装包校验文件
+        id: package
+        working-directory: dist
+        run: |
+          sha256sum *.fpk > SHA256SUMS
+          sed -n '/^version=/p' ../package/manifest >> "$GITHUB_OUTPUT"
+
+      - name: 上传安装包和 SHA-256 校验文件
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: icloud-photos-${{ steps.package.outputs.version }}
+          path: |
+            dist/*.fpk
+            dist/SHA256SUMS
+          if-no-files-found: error
+          compression-level: 0

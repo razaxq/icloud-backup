@@ -53,6 +53,8 @@
 
 ## 源码与构建
 
+推送到 `main`、创建指向提交的 `v*` 标签或向 `main` 提交拉取请求时，GitHub Actions 会构建并校验 AMD64、ARM64 两个安装包，并使用 AMD64 安装包中的依赖运行离线测试。也可在工作流页面点击 **Run workflow** 手动构建。成功后，在该次运行的 **Artifacts** 下载 `icloud-photos-<版本>`，解压即可取得两个 FPK 和 `SHA256SUMS` 校验文件。[打开自动构建页面](https://github.com/razaxq/icloud-backup/actions/workflows/build.yml)
+
 - `package/`：飞牛清单、生命周期脚本、安装与卸载向导、桌面入口。
 - `web/`：网关服务（`server.py`，接口与静态页面）、账户状态与调度（`archive.py`，账户、计划、恢复、目录浏览）、通知发送（`notifier.py`）和中文界面（`static/`）。
 - `worker/`：Apple 登录、图库扫描、实况识别、原件校验和文件写入。
